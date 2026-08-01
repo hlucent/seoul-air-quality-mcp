@@ -1,0 +1,18 @@
+# app 이름은 Fly.io 전역에서 유일해야 합니다.
+# 배포 전 `fly launch --no-deploy`로 실제 앱을 생성하면 자동으로 채워집니다.
+app = "seoul-air-quality-mcp"
+primary_region = "nrt"  # 도쿄 리전 - 한국에서 지연시간이 가장 짧음
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
