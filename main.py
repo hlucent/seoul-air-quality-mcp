@@ -98,3 +98,49 @@ async def get_hourly_air_quality(
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     mcp.run(transport="sse", host="0.0.0.0", port=port)
+
+@mcp.tool()
+async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
+    """
+    서울시 연도별 미세먼지(PM10) 경보발령 현황을 조회한다. (OA-2228 기반)
+    자치구 구분 없이 서울시 전체 기준 연도별 통계입니다.
+
+    [데이터셋 상태] 확인일: 2026-08-02 / 검증 결과: 검증 필요
+    2007~2025년 전 구간 발령횟수/발령일수/최대농도가 0으로 조회됨.
+    데이터갱신일은 최근(2025.11.04)이나 실제 값이 비어있어 원본 확인이 필요한 상태.
+
+    Args:
+        year: 조회할 연도 (예: "2024"). 비워두면 전체 연도 반환.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 30, 전체 연도 수)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/YearlyPM10Issue/{start}/{end}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("YearlyPM10Issue", {}).get("row", [])
+
+    if year:
+        rows = [r for r in rows if r.get("YR", "") == year]
+
+    warning = None
+    if rows:
+        recent = [r for r in rows if r.get("YR", "0") >= "2020"]
+        if recent and all(float(r.get("APNT_NMTM", 0)) == 0 for r in recent):
+            warning = (
+                "최근 5개년 발령횟수가 모두 0입니다. 실제로 경보가 없었거나, "
+                "이 데이터셋 값이 채워지지 않았을 수 있습니다. "
+                "원본(data.seoul.go.kr)에서 직접 확인을 권장합니다."
+            )
+
+    result = {
+        "count": len(rows),
+        "data": rows,
+    }
+    if warning:
+        result["_data_quality_warning"] = warning
+    return result
