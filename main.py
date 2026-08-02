@@ -97,7 +97,7 @@ async def get_hourly_air_quality(
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="sse", host="0.0.0.0", port=port)
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
 
 @mcp.tool()
 async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
