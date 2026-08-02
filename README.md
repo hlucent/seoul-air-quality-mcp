@@ -185,5 +185,67 @@ fly deploy
 - 2026-08-02: `get_realtime_air_quality`, `get_hourly_air_quality`에 환경부 통합대기환경지수(CAI) 기준 등급(`cai_grade`)·행동요령(`cai_guidance`) 자동 계산 로직 추가. 단, `get_hourly_air_quality`는 시간값을 기준으로 근사 계산하며, 공식 24시간 평균 기준 등급과는 다를 수 있음.
 
 ---
+🔌 Claude에 연결하는 방법
+> 설치 없이 **URL 하나만으로** 연결할 수 있습니다. 소요시간 약 3분.
+---
+📋 사전 준비 — 서울 열린데이터광장 API 키 발급
+data.seoul.go.kr 접속 → 회원가입 후 로그인
+오른쪽 상단 내 정보 → 인증키 관리 클릭
+발급된 인증키(API Key)를 복사해서 메모장에 저장
+> ✅ 무료입니다. 별도 심사 없이 즉시 발급됩니다.
+---
+연결 URL 형식
+```
+https://seoul-air-quality-mcp.fly.dev/mcp?key=여기에본인API키붙여넣기
+```
+예시:
+```
+https://seoul-air-quality-mcp.fly.dev/mcp?key=abc1234567890xyz
+```
+---
+방법 1 — Claude.ai 웹/앱에서 연결 (가장 간단)
+claude.ai 접속 후 로그인
+왼쪽 하단 프로필 아이콘 → Settings(설정) 클릭
+왼쪽 메뉴에서 Connectors(커넥터) 선택
+Add custom connector 버튼 클릭
+아래와 같이 입력:
+항목	입력값
+이름	`서울시 대기환경정보 MCP`
+원격 MCP 서버 URL	`https://seoul-air-quality-mcp.fly.dev/mcp?key=본인API키`
+Save 클릭 → 대화창에서 바로 사용 가능
+---
+방법 2 — Claude Desktop 앱에서 연결
+설정 파일(`claude_desktop_config.json`)을 열어 아래 내용을 추가합니다.
+설정 파일 위치 (Windows):
+```
+%APPDATA%\Claude\claude_desktop_config.json
+```
+추가할 내용:
+```json
+{
+  "mcpServers": {
+    "서울시 대기환경정보 MCP": {
+      "type": "http",
+      "url": "https://seoul-air-quality-mcp.fly.dev/mcp?key=본인API키"
+    }
+  }
+}
+```
+> 💡 파일이 이미 있는 경우, `"mcpServers": { }` 안에 위 내용을 추가하세요.  
+> 저장 후 Claude Desktop을 재시작하면 연결됩니다.
+---
+💬 연결 후 이렇게 질문해 보세요
+```
+지금 서울 대기질 어때?
+```
+```
+오늘 강남구 미세먼지 알려줘
+```
+```
+어제 시간대별 서울 오존 농도 보여줘
+```
+---
+
+---
 
 Made by 청정
