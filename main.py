@@ -190,6 +190,16 @@ _DATASET_INFO = {
             "필드가 없으므로, 지도 표시가 필요하면 MSRSTN_ADDR(주소)를 별도 지오코딩해야 합니다."
         ),
     },
+    "OA-15526": {
+        "dataset_name": "서울시 대기오염 측정정보(1시간단위)",
+        "dataset_id": "OA-15526",
+        "provider": "서울특별시 보건환경연구원 대기질통합분석센터",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-15526/S/1/datasetView.do",
+        # ⚠️ 이 데이터셋은 각 자치구 측정소 결과를 매시 5분마다 바로 보정해서 제공하는
+        # "실시간 잠정치"다. 국가(환경부/에어코리아) 사후검증을 거친 확정치가 아니므로,
+        # 도구 응답에 "_data_tier" 필드로 이 사실을 별도 명시한다 (사용자 지정 설계 원칙:
+        # 잠정치와 국가검증 확정치를 도구명·설명·응답 메타데이터 세 층위에서 구분할 것).
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -1439,6 +1449,79 @@ async def get_air_pollution_station_info(station_code: str = "", start: int = 1,
     return {
         "count": len(rows),
         "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_air_pollution_measurement(
+    station_code: str = "", item_code: str = "", msrmt_dt: str = "", start: int = 1, end: int = 100
+) -> dict:
+    """
+    서울시 대기오염 측정정보(시간평균 실측값)를 조회한다. (OA-15526 기반, 서비스명: airPolutionMeasuring1Hour)
+
+    ⚠️ 잠정치 주의: 이 데이터는 각 자치구 측정소에서 측정된 결과를 매시 5분마다 바로 보정해서
+    제공하는 "실시간 잠정치"다. 국가(환경부/에어코리아)의 사후 검증을 거친 확정치가 아니다.
+    공식 통계·연간 보고서에 인용할 때는 이 사실을 반드시 함께 밝히고, 확정치가 필요한 경우
+    별도로 확인이 필요하다는 점을 안내할 것.
+
+    ⚠️ 항목코드 해석 필요: 이 도구가 반환하는 ITEM_CD(측정항목 코드)는 숫자 코드일 뿐이다.
+    어떤 오염물질인지(PM10/PM2.5/O3 등) 알려면 get_air_pollution_item_info 도구로 코드를
+    대조해야 한다. 임의로 짐작해서 이름을 붙이지 말 것.
+
+    ⚠️ 측정소코드 해석 필요: MSRSTN_CD(측정소 코드)가 어느 측정소인지 알려면
+    get_air_pollution_station_info 도구로 대조해야 한다.
+
+    ⚠️ 측정기상태(MSRMT_STTS) 해석: 0=정상, 1=교정, 2=비정상, 4=전원단절, 8=보수중, 9=자료이상.
+    0(정상)이 아닌 값이 섞여 있으면 그 시각의 측정값을 신뢰하기 어렵다는 뜻이므로, 반드시 이
+    상태값을 함께 확인하고 필요하면 답변에 "측정기 상태가 정상이 아니었다"는 점을 명시할 것.
+
+    ⚠️ 제공기관 주의: 이 도구는 대기정책과가 아니라 서울특별시 보건환경연구원 대기질통합분석센터가
+    제공하는 데이터셋이다. 출처를 밝힐 때 이 차이를 명확히 표기할 것.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        MSRMT_DT: 측정일시 (YYYYMMDDHHMMSS)
+        MSRSTN_CD: 측정소 코드 (get_air_pollution_station_info로 대조)
+        ITEM_CD: 측정항목 코드 (get_air_pollution_item_info로 대조)
+        AVG_VL: 평균값
+        MSRMT_STTS: 측정기 상태 (0정상/1교정/2비정상/4전원단절/8보수중/9자료이상)
+        MSRMT_NTN_SE: 국가기준초과구분
+        MSRMT_LCLGV_SE: 지자체기준초과구분
+        STRG_DT: 저장일시
+
+    Args:
+        station_code: 측정소 코드 (MSRSTN_CD). 비워두면 전체 측정소.
+        item_code: 측정항목 코드 (ITEM_CD). 비워두면 전체 항목.
+        msrmt_dt: 측정일시 (예: "202608022100"). 비워두면 API가 기본으로 주는 최근 값을 반환.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "airPolutionMeasuring1Hour", str(start), str(end)]
+    if msrmt_dt:
+        parts.append(msrmt_dt)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("airPolutionMeasuring1Hour", {}).get("row", [])
+
+    if station_code:
+        rows = [r for r in rows if str(r.get("MSRSTN_CD", "")) == str(station_code)]
+    if item_code:
+        rows = [r for r in rows if str(r.get("ITEM_CD", "")) == str(item_code)]
+
+    citation = _citation("OA-15526", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_tier": "실시간 잠정치 (자치구 측정소 자체 보정값, 국가 사후검증 전 — 확정치 아님)",
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
     }
