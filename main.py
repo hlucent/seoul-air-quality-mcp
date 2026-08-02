@@ -95,10 +95,6 @@ async def get_hourly_air_quality(
     return {"count": len(rows), "data": rows}
 
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
-
 @mcp.tool()
 async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
     """
@@ -144,3 +140,7 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
     if warning:
         result["_data_quality_warning"] = warning
     return result
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
