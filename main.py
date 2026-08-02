@@ -200,6 +200,16 @@ _DATASET_INFO = {
         # 도구 응답에 "_data_tier" 필드로 이 사실을 별도 명시한다 (사용자 지정 설계 원칙:
         # 잠정치와 국가검증 확정치를 도구명·설명·응답 메타데이터 세 층위에서 구분할 것).
     },
+    "OA-1256": {
+        "dataset_name": "서울시 굴뚝 측정 정보",
+        "dataset_id": "OA-1256",
+        # 지금까지의 두 제공기관(대기정책과, 보건환경연구원 대기질통합분석센터)과 또 다르다.
+        # 이 데이터셋은 자원회수시설(소각장) 배출 감시가 목적이므로 담당 부서도 다르다.
+        "provider": "서울특별시 기후환경본부 자원회수시설추진단 자원회수시설과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-1256/S/1/datasetView.do",
+        # ⚠️ 배출허용기준(법적 한도) 필드가 없다 — 실측값(MSRMT_VL)만 제공한다.
+        # 기준 초과 여부는 이 데이터만으로 판단할 수 없으므로 도구 docstring에서 별도 강조.
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -1522,6 +1532,68 @@ async def get_air_pollution_measurement(
         "count": len(rows),
         "data": rows,
         "_data_tier": "실시간 잠정치 (자치구 측정소 자체 보정값, 국가 사후검증 전 — 확정치 아님)",
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_chimney_emission_measurement(
+    facility_name: str = "", pollutant: str = "", start: int = 1, end: int = 100
+) -> dict:
+    """
+    서울시 4개 자원회수시설(소각장) 굴뚝의 대기오염물질 자동측정값을 조회한다. (OA-1256 기반, 서비스명: CleanSYSService)
+
+    이 도구는 시민이 숨 쉬는 주변 대기질이 아니라, 오염물질을 배출하는 시설(소각장) 자체의
+    배출량을 24시간 자동측정기로 감시하는 데이터다. 배출원 감시·단속 업무에 사용한다.
+
+    ⚠️ 배출허용기준(법적 한도) 없음: 이 데이터셋은 실측값(MSRMT_VL)만 제공하며, 대기환경보전법
+    등에 정해진 배출허용기준 수치는 포함하지 않는다. "기준을 초과했는지" 여부는 이 실측값만으로
+    단정하거나 추측해서 답하지 말 것. 초과 여부 판단이 필요하면 별도로 관련 법령·고시의 배출허용
+    기준을 확인해야 한다고 안내할 것.
+
+    ⚠️ 대상 시설 고정: 강남·노원·마포·양천 4개 자원회수시설(소각장)로 한정되어 있다.
+    facility_name에는 "강남"/"노원"/"마포"/"양천"처럼 짧은 지역명만 넣는다("OO자원회수시설"이
+    아님). 응답의 FCLT_NM 필드에 전체 명칭이 담겨 있다.
+
+    ⚠️ 제공기관 주의: 이 도구는 대기정책과·보건환경연구원과 달리 서울특별시 기후환경본부
+    자원회수시설추진단 자원회수시설과가 제공하는 데이터셋이다. 출처 표기 시 이 차이를 명확히 할 것.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        MSRMT_DT: 측정일시
+        FCLT_NM: 시설명 (예: 강남자원회수시설)
+        STACK_NM: 굴뚝명 (예: 1호기(1번굴뚝))
+        ARTCL: 측정항목 (예: 먼지, 질소산화물 등 — 코드가 아닌 한글 항목명)
+        MSRMT_VL: 측정값
+
+    Args:
+        facility_name: 시설명 (예: "강남", "노원", "마포", "양천"). 비워두면 원본 API 특성상
+            응답이 비거나 제한될 수 있으니, 가능하면 지정해서 호출할 것.
+        pollutant: 측정항목명 (예: "먼지"). 비워두면 해당 시설의 전체 항목.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "CleanSYSService", str(start), str(end)]
+    if facility_name:
+        parts.append(facility_name)
+        if pollutant:
+            parts.append(pollutant)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("CleanSYSService", {}).get("row", [])
+
+    citation = _citation("OA-1256", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
     }
