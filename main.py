@@ -57,19 +57,107 @@ _DATASET_INFO = {
         "dataset_id": "OA-2228",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-2228/S/1/datasetView.do",
+        # 포털 데이터셋 상세페이지에 표기된 갱신일자(사람이 직접 확인해서 기록한 값).
+        # API 응답 자체에는 갱신일자가 없어서, 이 값은 자동 계산이 아니라 수동 확인값이다.
+        "portal_last_verified": "2025-11-04 (확인일 2026-08-02 기준)",
     },
     "OA-12855": {
         "dataset_name": "서울시 대기오염물질 측정소 높이 정보",
         "dataset_id": "OA-12855",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-12855/S/1/datasetView.do",
+        # 이 데이터셋은 API 응답에 측정일시/갱신일자 필드가 전혀 없는 정적 참고정보다.
+        # 기준일자를 자동으로 계산할 수 없으므로, 그 사실 자체를 응답에 명시한다.
+        "static_reference_note": (
+            "이 데이터셋은 실시간 측정값이 아닌 정적 참고정보(측정소 채취구 높이)이며, "
+            "API 응답에 갱신일자 필드가 없습니다. 최신 여부는 원문 링크의 데이터셋 상세페이지에서 "
+            "직접 확인해야 합니다."
+        ),
     },
 }
 
+# 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
+_DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE"]
+
+
+def _format_msrdt(raw: str) -> str:
+    """'YYYYMMDDHHMM' 또는 'YYYYMMDDHH', 'YYYYMMDD' 형식의 문자열을 사람이 읽기 좋은 형태로 바꾼다."""
+    s = str(raw)
+    try:
+        if len(s) >= 12:
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}"
+        if len(s) >= 10:
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}시"
+        if len(s) >= 8:
+            return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+    except Exception:
+        pass
+    return s
+
+
+def _latest_reference_datetime(rows: list) -> str | None:
+    """행 데이터에 측정일시 필드가 있으면, 그 중 가장 최신 값을 '기준일자'로 계산해 반환한다."""
+    values = []
+    for r in rows:
+        for field in _DATETIME_FIELD_CANDIDATES:
+            if r.get(field):
+                values.append(str(r[field]))
+                break
+    if not values:
+        return None
+    return _format_msrdt(max(values))
+
+
+def _citation(dataset_id: str, rows: list | None = None, year_field: str | None = None) -> dict:
+    """
+    출처(_data_source)와, 답변 끝에 그대로 출력해야 하는 완성 문장(_citation_required)을 생성한다.
+
+    기준일자 결정 순서:
+    1. rows에 측정일시 필드(MSRDT 등)가 있으면 → 그 중 최신값을 기준일자로 사용 (실시간/시간평균류)
+    2. year_field가 지정되어 있으면 → 조회된 연도 범위를 기준일자로 사용 (연도별 통계류)
+    3. 둘 다 없으면 → _DATASET_INFO의 static_reference_note를 기준일자 자리에 사용
+       (=API에 갱신일자 정보 자체가 없다는 사실을 그대로 답변에 노출시킨다. 임의로 날짜를 지어내지 않는다.)
+
+    이 함수가 반환하는 "citation_text"는 반드시 답변 맨 끝에 그대로("출처: ..." 문장 전체) 포함해야 한다.
+    생략, 요약, 재구성 금지.
+    """
+    info = dict(_DATASET_INFO.get(
+        dataset_id,
+        {"dataset_name": "미등록 데이터셋", "dataset_id": dataset_id,
+         "provider": "확인 필요", "source_url": ""},
+    ))
+
+    reference_date = None
+    if rows:
+        reference_date = _latest_reference_datetime(rows)
+
+    if not reference_date and year_field and rows:
+        years = sorted({str(r.get(year_field)) for r in rows if r.get(year_field)})
+        if years:
+            reference_date = f"{years[0]}~{years[-1]}년 (연도별 통계, 개별 연도는 데이터 참조)"
+
+    if not reference_date:
+        reference_date = info.get(
+            "static_reference_note",
+            "이 데이터셋에는 자동 갱신일자 정보가 없습니다 — 원문 링크에서 직접 확인 필요",
+        )
+
+    citation_text = (
+        f"출처: {info.get('dataset_name')} ({dataset_id}, {info.get('provider')}) "
+        f"| 기준일자: {reference_date} "
+        f"| 원문 링크: {info.get('source_url')}"
+    )
+    if info.get("portal_last_verified"):
+        citation_text += f" | 포털 등록 갱신일: {info['portal_last_verified']}"
+
+    info["reference_date"] = reference_date
+    info["citation_text"] = citation_text
+    return info
+
 
 def _source(dataset_id: str) -> dict:
-    """dataset_id(OA번호)에 해당하는 출처 정보를 반환한다. 모든 도구 응답에 _data_source로 포함시킬 것."""
-    return _DATASET_INFO.get(dataset_id, {"dataset_id": dataset_id, "note": "출처 정보 미등록"})
+    """하위호환용. 새 도구는 _citation()을 사용할 것."""
+    return _citation(dataset_id)
 
 
 # 통합대기환경지수(CAI) 산정 기준 (환경부 공식 등급기준)
@@ -156,8 +244,9 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     """
     서울시 25개 자치구의 실시간 대기환경 현황을 조회한다. (OA-1200 기반)
 
-    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
-    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
     각 자치구 데이터에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
     cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
@@ -184,10 +273,12 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
 
     rows = [_add_air_quality_grade(r) for r in rows]
 
+    citation = _citation("OA-1200", rows=rows)
     return {
         "count": len(rows),
         "data": rows,
-        "_data_source": _source("OA-1200"),
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
     }
 
 
@@ -198,8 +289,9 @@ async def get_hourly_air_quality(
     """
     특정 날짜(또는 특정 시)의 자치구별 시간평균 대기오염도를 조회한다. (OA-2275 기반)
 
-    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
-    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         MSRMT_DT: 측정일시 (YYYYMMDDHH)
@@ -238,7 +330,13 @@ async def get_hourly_air_quality(
 
     rows = data.get("TimeAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-    return {"count": len(rows), "data": rows, "_data_source": _source("OA-2275")}
+    citation = _citation("OA-2275", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
 
 
 @mcp.tool()
@@ -250,8 +348,9 @@ async def get_roadside_air_quality(
     ※ 자치구 도시대기측정망과는 별도로, 도로변(일반도로/전용차로/중앙차로)에 설치된
     측정소에서 측정한 값이며 최종검증 전 실시간(잠정치) 자료이다.
 
-    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
-    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         MSRMT_DT: 측정일시
@@ -290,7 +389,13 @@ async def get_roadside_air_quality(
 
     rows = data.get("RealtimeRoadsideStation", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-    return {"count": len(rows), "data": rows, "_data_source": _source("OA-2223")}
+    citation = _citation("OA-2223", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
 
 
 @mcp.tool()
@@ -302,8 +407,9 @@ async def get_zonal_hourly_air_quality(
     ※ 데이터셋 이름은 "기간별"이지만 실제로는 여러 날짜를 한 번에 조회하는 것이 아니라,
     지정한 "특정 한 시각"의 데이터를 조회하는 API이다. 여러 시각을 보려면 이 도구를 반복 호출해야 한다.
 
-    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
-    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
     ⚠️ 시간(hour) 표기가 get_hourly_air_quality(00~23)와 다르다. 이 API는 01~24이며,
     24는 해당 날짜의 마지막 시간(자정)을 의미한다. 헷갈리지 않도록 주의할 것.
@@ -363,7 +469,13 @@ async def get_zonal_hourly_air_quality(
         r_for_grade.pop("PM", None)  # 원본 응답에 없던 임시 필드는 제거
         graded_rows.append(r_for_grade)
 
-    return {"count": len(graded_rows), "data": graded_rows, "_data_source": _source("OA-2221")}
+    citation = _citation("OA-2221", rows=rows)
+    return {
+        "count": len(graded_rows),
+        "data": graded_rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
 
 
 @mcp.tool()
@@ -372,8 +484,9 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
     서울시 연도별 미세먼지(PM10) 경보발령 현황을 조회한다. (OA-2228 기반)
     자치구 구분 없이 서울시 전체 기준 연도별 통계입니다.
 
-    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
-    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(조회된 연도 범위 + 포털 등록 갱신일)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
     [데이터셋 상태] 확인일: 2026-08-02 / 검증 결과: 검증 필요
     2007~2025년 전 구간 발령횟수/발령일수/최댓농도값이 0으로 조회됨.
@@ -407,10 +520,12 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
                 "원본(data.seoul.go.kr)에서 직접 확인을 권장합니다."
             )
 
+    citation = _citation("OA-2228", rows=rows, year_field="YR")
     result = {
         "count": len(rows),
         "data": rows,
-        "_data_source": _source("OA-2228"),
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
     }
     if warning:
         result["_data_quality_warning"] = warning
@@ -425,8 +540,11 @@ async def get_station_height_info(station_name: str = "", start: int = 1, end: i
     얼마나 높은 곳에 설치되어 있는지를 알려주는 참고 정보이다. 측정값을 해석할 때
     "이 수치가 지표면 근처 공기인지, 높은 곳 공기인지"를 감안하는 용도로 쓴다.
 
-    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
-    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    ※ 이 데이터셋은 API 응답에 측정일시/갱신일자 필드가 없는 정적 참고정보이므로,
+    "_citation_required" 문장에는 실제 날짜 대신 "이 데이터셋에는 자동 갱신일자가 없다"는
+    사실과 원문 링크가 담겨 있다. 이 경우에도 문장을 임의로 바꾸거나 날짜를 지어내지 말고,
+    주어진 문장을 그대로 출력할 것.
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         SEQ: 순서
@@ -453,10 +571,12 @@ async def get_station_height_info(station_name: str = "", start: int = 1, end: i
     if station_name:
         rows = [r for r in rows if station_name in r.get("MSRSTN_NM", "")]
 
+    citation = _citation("OA-12855", rows=rows)
     return {
         "count": len(rows),
         "data": rows,
-        "_data_source": _source("OA-12855"),
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
     }
 
 
