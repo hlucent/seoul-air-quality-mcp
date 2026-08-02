@@ -236,6 +236,76 @@ async def get_roadside_air_quality(
 
 
 @mcp.tool()
+async def get_zonal_hourly_air_quality(
+    date: str, hour: str, sarea: str = "", station_name: str = "", start: int = 1, end: int = 100
+) -> dict:
+    """
+    특정 날짜·시각의 권역별/측정소별 시간평균 대기환경 정보를 조회한다. (OA-2221 기반, 서비스명: TimeAverageCityAir)
+    ※ 데이터셋 이름은 "기간별"이지만 실제로는 여러 날짜를 한 번에 조회하는 것이 아니라,
+    지정한 "특정 한 시각"의 데이터를 조회하는 API이다. 여러 시각을 보려면 이 도구를 반복 호출해야 한다.
+
+    ⚠️ 시간(hour) 표기가 get_hourly_air_quality(00~23)와 다르다. 이 API는 01~24이며,
+    24는 해당 날짜의 마지막 시간(자정)을 의미한다. 헷갈리지 않도록 주의할 것.
+
+    자치구 단위가 아니라 권역(SAREA_NM, 예: 도심권/서북권/동북권/서남권/동남권) 단위로 묶여서 나오며,
+    기존 도구에는 없는 미세먼지 24시간 평균값(PM_ALDY)도 함께 제공한다.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        MSRMT_DT: 측정일시
+        SAREA_CD: 권역코드
+        SAREA_NM: 권역명
+        MSRSTN_CD: 측정소코드
+        MSRSTN_NM: 측정소명
+        PM_HOUR: 미세먼지 1시간 평균 (μg/m³)
+        PM_ALDY: 미세먼지 24시간 평균 (μg/m³)
+        FPM: 초미세먼지 (μg/m³)
+        OZON: 오존 농도 (ppm)
+        NTDX: 이산화질소 농도 (ppm)
+        CBMX: 일산화탄소 농도 (ppm)
+        SPDX: 아황산가스 농도 (ppm)
+
+    각 행에는 PM_HOUR(1시간 평균)를 기준으로 환경부 통합대기환경지수(CAI)를 직접 계산한
+    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
+    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
+
+    Args:
+        date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801")
+        hour: 시(01~24) 두 자리 숫자로 (예: "11"). 24는 해당 날짜의 마지막 시간을 의미.
+        sarea: 권역명 (예: "도심권", "서북권", "동북권", "서남권", "동남권"). 비워두면 전체 권역.
+        station_name: 측정소명 (예: "종로구"). 비워두면 전체 측정소.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+
+    msrmt_dt = date + hour + "00"  # YYYYMMDDHHMM, 분은 항상 00
+
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "TimeAverageCityAir", str(start), str(end), msrmt_dt]
+    if sarea:
+        parts.append(sarea)
+    if station_name:
+        parts.append(station_name)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("TimeAverageCityAir", {}).get("row", [])
+
+    graded_rows = []
+    for r in rows:
+        r_for_grade = dict(r)
+        r_for_grade["PM"] = r.get("PM_HOUR")  # CAI 계산용: 1시간 평균값을 PM10 기준으로 사용
+        r_for_grade = _add_air_quality_grade(r_for_grade)
+        r_for_grade.pop("PM", None)  # 원본 응답에 없던 임시 필드는 제거
+        graded_rows.append(r_for_grade)
+
+    return {"count": len(graded_rows), "data": graded_rows}
+
+
+@mcp.tool()
 async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
     """
     서울시 연도별 미세먼지(PM10) 경보발령 현황을 조회한다. (OA-2228 기반)
