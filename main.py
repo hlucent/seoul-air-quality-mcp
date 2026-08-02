@@ -176,6 +176,20 @@ _DATASET_INFO = {
             "이 도구는 그 수치를 해석하기 위한 참고 정보로만 사용하세요."
         ),
     },
+    "OA-15516": {
+        "dataset_name": "서울시 대기오염 측정소 정보",
+        "dataset_id": "OA-15516",
+        "provider": "서울특별시 보건환경연구원 대기질통합분석센터",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-15516/S/1/datasetView.do",
+        # 이 데이터셋은 측정값이 아니라 측정소명·주소·공인코드 등 정적 메타정보다.
+        # ⚠️ 좌표(X/Y, 위도/경도) 필드가 없다 — MSRSTN_ADDR(주소, 텍스트)만 제공된다.
+        # 지도 시각화가 필요하면 이 주소를 카카오맵 등 지오코딩 API로 별도 변환해야 한다.
+        "static_reference_note": (
+            "이 데이터셋은 실시간 측정값이 아닌 측정소 메타정보(측정소명·주소·공인코드)이며, "
+            "제공기관은 보건환경연구원 대기질통합분석센터입니다. 이 데이터셋에는 좌표(위도/경도) "
+            "필드가 없으므로, 지도 표시가 필요하면 MSRSTN_ADDR(주소)를 별도 지오코딩해야 합니다."
+        ),
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -1366,6 +1380,62 @@ async def get_air_pollution_item_info(item_code: str = "", start: int = 1, end: 
     rows = data.get("airPolutionMeasuringItem", {}).get("row", [])
 
     citation = _citation("OA-15515", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_air_pollution_station_info(station_code: str = "", start: int = 1, end: int = 30) -> dict:
+    """
+    서울시 대기오염 측정소 정보(측정소명·주소·공인코드)를 조회한다. (OA-15516 기반, 서비스명: airPolutionMeasuringPlace)
+
+    ⚠️ 중요: 이 도구는 대기질 실측값(농도)이 아니라, 측정소 자체의 기본 정보(이름·주소·코드)를
+    알려주는 메타정보 도구다. "지금 대기질이 어떤가"를 묻는 질문에는 이 도구가 아니라
+    get_realtime_air_quality 등 실측값 도구를 사용해야 한다. 이 도구는 특정 측정소의 위치·명칭을
+    확인하거나, 실측값 응답의 측정소 코드(MSRSTN_CD)가 어느 측정소인지 대조할 때 사용한다.
+
+    ⚠️ 좌표 없음: 이 데이터셋에는 위도/경도 좌표 필드가 없다. MSRSTN_ADDR(주소, 텍스트)만
+    제공되므로, 지도 표시가 필요하면 이 주소를 별도 지오코딩(예: 카카오맵)해야 한다고
+    안내할 것. 좌표가 있는 것처럼 답하지 말 것.
+
+    ⚠️ 제공기관 주의: 이 도구는 지금까지의 다른 도구들(서울특별시 기후환경본부 대기정책과 제공)과
+    달리 서울특별시 보건환경연구원 대기질통합분석센터가 제공하는 데이터셋이다. 답변에서
+    출처를 밝힐 때 이 차이를 명확히 표기할 것.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    ※ 이 데이터셋은 측정소 메타정보 정적 참고자료이므로 "_citation_required" 문장에는
+    실제 관측일자 대신 그 사실과 제공기관·원문 링크가 담겨 있다. 문장을 임의로 바꾸거나
+    날짜를 지어내지 말고 주어진 문장을 그대로 출력할 것.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        MSRSTN_CD: 측정소 코드
+        MSRSTN_NM: 측정소 이름
+        MSRSTN_ADDR: 측정소 주소
+        INDCT_SEQ: 표시 순서
+        MSRSTN_OFFICAL_CD: 공인코드
+
+    Args:
+        station_code: 측정소 코드 (MSRSTN_CD). 비워두면 전체 측정소.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 30, 서울시 측정소 수 기준)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringPlace/{start}/{end}/"
+    if station_code:
+        url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringPlace/{start}/{end}/{station_code}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("airPolutionMeasuringPlace", {}).get("row", [])
+
+    citation = _citation("OA-15516", rows=rows)
     return {
         "count": len(rows),
         "data": rows,
