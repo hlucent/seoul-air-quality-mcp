@@ -74,6 +74,20 @@ _DATASET_INFO = {
             "직접 확인해야 합니다."
         ),
     },
+    "OA-1201": {
+        "dataset_name": "서울시 실시간 대기환경 평균 현황",
+        "dataset_id": "OA-1201",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-1201/S/1/datasetView.do",
+        # 이 API는 매시간 갱신되지만(갱신주기: 정기/1시간단위), 응답 필드 자체에는
+        # 측정일시(MSRDT 등) 필드가 없다. 실제 측정시각을 알 수 없으므로 지어내지 않고,
+        # "조회 시점 기준"이라는 사실을 그대로 명시한다.
+        "static_reference_note": (
+            "이 데이터셋은 매시간 갱신되지만 API 응답에 측정일시 필드가 없습니다. "
+            "따라서 아래 수치는 '조회한 시점 기준 최신값'이며, 정확한 측정시각이 필요하면 "
+            "원문 링크의 실시간 화면에서 직접 확인해야 합니다."
+        ),
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -367,6 +381,72 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
     })
+
+
+@mcp.tool()
+async def get_seoul_average_air_quality(cai_grade: str = "", start: int = 1, end: int = 5) -> dict:
+    """
+    서울시 25개 자치구의 대기환경정보 측정수치를 합산·평균낸 "서울시 전체 평균" 현황을 조회한다.
+    (OA-1201 기반, 서비스명: ListAvgOfSeoulAirQualityService)
+
+    ※ 자치구별/측정소별 개별 수치가 아니라, 서울시 전체를 하나의 값으로 합산한 도시 단위
+    지표이다. 특정 자치구나 측정소의 수치가 필요하면 이 도구 대신 get_realtime_air_quality를
+    사용할 것. 이 둘을 혼동해서 "서울시 평균"을 "특정 자치구 수치"인 것처럼 답변하지 말 것.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    ※ 이 API 응답에는 측정일시 필드가 없다. "_citation_required" 문장에는 실제 측정시각
+    대신 "조회 시점 기준" 안내문이 이미 담겨 있으니, 임의로 시각을 지어내지 말고 그 문장을
+    그대로 출력할 것.
+
+    ※ 이 데이터셋은 통합대기환경지수(CAI)와 등급(CAI_GRD), 지배오염물질(CRST_SBSTN)을
+    서울시가 자체적으로 이미 계산해 제공한다. 다른 도구(get_realtime_air_quality 등)처럼
+    Claude가 개별 오염물질 값으로 CAI를 다시 계산하지 않고, 원본 값을 그대로 사용하고
+    인용할 것 (중복 계산으로 인한 값 불일치 방지).
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        CAI_GRD: 통합대기환경지수 등급 (좋음/보통/나쁨/매우나쁨)
+        CAI: 통합대기환경지수 (수치)
+        CRST_SBSTN: 지수를 결정한 오염물질명
+        NTDX: 이산화질소 평균 (ppm)
+        OZON: 오존 평균 (ppm)
+        CBMX: 일산화탄소 평균 (ppm)
+        SPDX: 아황산가스 평균 (ppm)
+        PM: 미세먼지 PM10 평균 (μg/m³)
+        FPM: 초미세먼지 PM2.5 평균 (μg/m³)
+
+    각 행에는 CAI_GRD 값에 대응하는 cai_guidance(야외활동 행동요령 안내문)가 함께 담겨 있다.
+
+    Args:
+        cai_grade: 통합대기환경지수 등급으로 필터링 (예: "좋음", "보통", "나쁨", "매우나쁨"). 비워두면 전체.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 5)
+    """
+    _check_key()
+
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "ListAvgOfSeoulAirQualityService", str(start), str(end)]
+    if cai_grade:
+        parts.append(cai_grade)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("ListAvgOfSeoulAirQualityService", {}).get("row", [])
+
+    for r in rows:
+        grade = r.get("CAI_GRD")
+        if grade in _GRADE_GUIDANCE:
+            r["cai_guidance"] = _GRADE_GUIDANCE[grade]
+
+    citation = _citation("OA-1201", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
 
 
 @mcp.tool()
