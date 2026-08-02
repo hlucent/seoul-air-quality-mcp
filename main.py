@@ -166,11 +166,66 @@ def _source(dataset_id: str) -> dict:
 # (공무원 보고서 작성 시 "이 수치를 그대로 인용해도 되는지"를 즉시 판단할 수 있도록,
 #  선택 정보가 아니라 응답에 항상 포함되는 기본 정보로 취급한다.)
 _HEIGHT_CAVEAT = (
-    "⚠️ 대표성 참고: 이 수치는 측정소의 채취구 높이에서 측정된 값이며, "
-    "실제 보행자가 지표면 근처에서 체감하는 농도와 다를 수 있습니다(특히 미세먼지는 "
-    "지표면에 가까울수록 농도가 높은 경향). 특정 측정소의 정확한 채취구 높이는 "
-    "get_station_height_info 도구로 확인할 수 있습니다."
+    "⚠️ 대표성 참고: 각 측정소 행의 station_intake_height_m(채취구 높이, m 단위 실측값)과 "
+    "station_location_address(측정소 위치)를 함께 확인하세요. '높다/낮다'로 뭉뚱그리지 말고, "
+    "실제 수치와 주소를 답변에 명시할 것. 채취구가 지상보다 높은 곳에 설치된 경우, 실제 보행자가 "
+    "지표면 근처에서 체감하는 농도와 다를 수 있습니다(특히 미세먼지는 지표면에 가까울수록 농도가 높은 경향)."
 )
+
+
+async def _get_station_heights() -> dict:
+    """
+    측정소 채취구 높이 정보(OA-12855, 서비스명 airHgt)를 조회해
+    측정소명 → {height_m, address, category} 매핑으로 반환한다.
+
+    농도값을 반환하는 도구들이 "높다/낮다" 같은 뭉뚱그린 표현 대신, 실제 수치(m)와
+    위치를 응답에 직접 병합하기 위해 내부적으로 호출한다. 조회 실패 시에도 전체 응답이
+    깨지지 않도록 빈 dict를 반환한다(농도 조회 자체는 항상 성공해야 하므로).
+    """
+    try:
+        _check_key()
+        url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airHgt/1/100/"
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception:
+        return {}
+
+    rows = data.get("airHgt", {}).get("row", [])
+    heights = {}
+    for r in rows:
+        name = str(r.get("MSRSTN_NM", "")).strip()
+        if name:
+            heights[name] = {
+                "height_m": r.get("MSRSTN_HGT"),
+                "address": r.get("ROAD_NM_ADDR"),
+                "category": r.get("SE"),
+            }
+    return heights
+
+
+def _attach_station_info(rows: list, heights: dict, station_field: str = "MSRSTN_NM") -> list:
+    """
+    각 행에 실제 채취구 높이(station_intake_height_m, m)와 측정소 위치(station_location_address)를 붙인다.
+    이름이 정확히 일치하지 않으면 부분일치(포함 관계)로 한 번 더 시도한다.
+    매칭되는 정보가 없으면 그 사실 자체를 필드에 명시한다(값을 비워서 조용히 생략하지 않는다).
+    """
+    for r in rows:
+        name = str(r.get(station_field, "")).strip()
+        info = heights.get(name)
+        if not info:
+            for h_name, h_info in heights.items():
+                if h_name and (h_name in name or name in h_name):
+                    info = h_info
+                    break
+        if info:
+            r["station_intake_height_m"] = info.get("height_m")
+            r["station_location_address"] = info.get("address")
+        else:
+            r["station_intake_height_m"] = None
+            r["station_location_address"] = "채취구 높이/위치 정보 없음 (OA-12855에서 매칭되는 측정소를 찾지 못함)"
+    return rows
 
 
 def _with_height_caveat(result: dict) -> dict:
@@ -271,6 +326,12 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
     보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
 
+    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
+    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
+    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
+    명시해야 한다(조용히 생략 금지).
+
     각 자치구 데이터에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
     cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
     cai_guidance(야외활동 행동요령)가 함께 담겨 있어, 단순히 원시 수치를 해석하지 않아도
@@ -296,6 +357,9 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
 
     rows = [_add_air_quality_grade(r) for r in rows]
 
+    heights = await _get_station_heights()
+    rows = _attach_station_info(rows, heights)
+
     citation = _citation("OA-1200", rows=rows)
     return _with_height_caveat({
         "count": len(rows),
@@ -319,6 +383,12 @@ async def get_hourly_air_quality(
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
     측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
     보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
+
+    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
+    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
+    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
+    명시해야 한다(조용히 생략 금지).
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         MSRMT_DT: 측정일시 (YYYYMMDDHH)
@@ -357,6 +427,10 @@ async def get_hourly_air_quality(
 
     rows = data.get("TimeAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
+
+    heights = await _get_station_heights()
+    rows = _attach_station_info(rows, heights)
+
     citation = _citation("OA-2275", rows=rows)
     return _with_height_caveat({
         "count": len(rows),
@@ -382,6 +456,12 @@ async def get_roadside_air_quality(
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
     측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
     보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
+
+    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
+    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
+    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
+    명시해야 한다(조용히 생략 금지).
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         MSRMT_DT: 측정일시
@@ -420,6 +500,10 @@ async def get_roadside_air_quality(
 
     rows = data.get("RealtimeRoadsideStation", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
+
+    heights = await _get_station_heights()
+    rows = _attach_station_info(rows, heights)
+
     citation = _citation("OA-2223", rows=rows)
     return _with_height_caveat({
         "count": len(rows),
@@ -445,6 +529,12 @@ async def get_zonal_hourly_air_quality(
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
     측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
     보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
+
+    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
+    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
+    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
+    명시해야 한다(조용히 생략 금지).
 
     ⚠️ 시간(hour) 표기가 get_hourly_air_quality(00~23)와 다르다. 이 API는 01~24이며,
     24는 해당 날짜의 마지막 시간(자정)을 의미한다. 헷갈리지 않도록 주의할 것.
@@ -505,6 +595,10 @@ async def get_zonal_hourly_air_quality(
         graded_rows.append(r_for_grade)
 
     citation = _citation("OA-2221", rows=rows)
+
+    heights = await _get_station_heights()
+    graded_rows = _attach_station_info(graded_rows, heights)
+
     return _with_height_caveat({
         "count": len(graded_rows),
         "data": graded_rows,
