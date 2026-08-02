@@ -185,7 +185,8 @@ fly deploy
 - 2026-08-02: `get_realtime_air_quality`, `get_hourly_air_quality`에 환경부 통합대기환경지수(CAI) 기준 등급(`cai_grade`)·행동요령(`cai_guidance`) 자동 계산 로직 추가. 단, `get_hourly_air_quality`는 시간값을 기준으로 근사 계산하며, 공식 24시간 평균 기준 등급과는 다를 수 있음.
 
 ---
-🔌 Claude에 연결하는 방법
+
+## 🔌Claude에 연결하는 방법
 > 설치 없이 **URL 하나만으로** 연결할 수 있습니다. 소요시간 약 3분.
 ---
 📋 사전 준비 — 서울 열린데이터광장 API 키 발급
