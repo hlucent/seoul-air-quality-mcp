@@ -120,14 +120,20 @@ _DATASET_INFO = {
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-2218/S/1/datasetView.do",
     },
+    "OA-2217": {
+        "dataset_name": "서울시 월별 평균 대기오염도 정보",
+        "dataset_id": "OA-2217",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-2217/S/1/datasetView.do",
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
-_DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE", "MSRMT_YMD"]
+_DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE", "MSRMT_YMD", "MSRMT_MM"]
 
 
 def _format_msrdt(raw: str) -> str:
-    """'YYYYMMDDHHMM' 또는 'YYYYMMDDHH', 'YYYYMMDD' 형식의 문자열을 사람이 읽기 좋은 형태로 바꾼다."""
+    """'YYYYMMDDHHMM' 또는 'YYYYMMDDHH', 'YYYYMMDD', 'YYYYMM' 형식의 문자열을 사람이 읽기 좋은 형태로 바꾼다."""
     s = str(raw)
     try:
         if len(s) >= 12:
@@ -136,6 +142,8 @@ def _format_msrdt(raw: str) -> str:
             return f"{s[0:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}시"
         if len(s) >= 8:
             return f"{s[0:4]}-{s[4:6]}-{s[6:8]}"
+        if len(s) == 6:
+            return f"{s[0:4]}-{s[4:6]}"
     except Exception:
         pass
     return s
@@ -858,6 +866,75 @@ async def get_daily_air_quality(date: str, station_name: str = "", start: int = 
     rows = _attach_station_info(rows, heights)
 
     citation = _citation("OA-2218", rows=rows)
+    return _with_height_caveat({
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    })
+
+
+@mcp.tool()
+async def get_monthly_air_quality(month: str, station_name: str = "", start: int = 1, end: int = 100) -> dict:
+    """
+    특정 월의 측정소별(자치구 측정소 + 도로변 측정소 포함) 월평균 대기오염도 정보를 조회한다.
+    (OA-2217 기반, 서비스명: MonthlyAverageAirQuality)
+    ※ get_daily_air_quality(OA-2218, 일평균)보다 더 긴 기간(한 달 전체)을 하나의 평균값으로
+    묶어서 보여준다. 특정 날짜가 아니라 "이번 달 전체적으로" 같은 질문에 적합하다.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(조회한 월)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
+
+    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
+    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
+    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
+
+    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
+    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
+    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
+    명시해야 한다(조용히 생략 금지).
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        MSRMT_MM: 측정월 (YYYYMM)
+        MSRSTN_NM: 측정소명 (자치구명 또는 도로변 측정소명)
+        NTDX: 이산화질소 월평균 (ppm)
+        OZON: 오존 월평균 (ppm)
+        CBMX: 일산화탄소 월평균 (ppm)
+        SPDX: 아황산가스 월평균 (ppm)
+        PM: 미세먼지 월평균 (μg/m³)
+        FPM: 초미세먼지 월평균 (μg/m³)
+
+    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
+    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
+    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
+
+    Args:
+        month: 조회할 월, YYYYMM 형식 (예: "202608")
+        station_name: 측정소명 (예: "강남구", "강변북로"). 비워두면 전체 측정소.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "MonthlyAverageAirQuality", str(start), str(end), month]
+    if station_name:
+        parts.append(station_name)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("MonthlyAverageAirQuality", {}).get("row", [])
+    rows = [_add_air_quality_grade(r) for r in rows]
+
+    heights = await _get_station_heights()
+    rows = _attach_station_info(rows, heights)
+
+    citation = _citation("OA-2217", rows=rows)
     return _with_height_caveat({
         "count": len(rows),
         "data": rows,
