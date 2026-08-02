@@ -132,6 +132,19 @@ _DATASET_INFO = {
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-2224/S/1/datasetView.do",
     },
+    "OA-15140": {
+        "dataset_name": "서울시 대기오염전광판 위치정보",
+        "dataset_id": "OA-15140",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-15140/S/1/datasetView.do",
+        # 이 데이터셋은 대기질 측정값이 아니라 전광판 설치 위치(좌표 포함)를 알려주는
+        # 정적 참고정보다. API 응답에 갱신일자 필드가 없다.
+        "static_reference_note": (
+            "이 데이터셋은 실시간 측정값이 아닌 정적 참고정보(대기오염전광판 설치 위치·좌표)이며, "
+            "API 응답에 갱신일자 필드가 없습니다. 최신 여부는 원문 링크의 데이터셋 상세페이지에서 "
+            "직접 확인해야 합니다."
+        ),
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -1025,6 +1038,64 @@ async def get_monthly_air_quality(month: str, station_name: str = "", start: int
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
     })
+
+
+@mcp.tool()
+async def get_air_pollution_board_locations(
+    district: str = "", location: str = "", start: int = 1, end: int = 100
+) -> dict:
+    """
+    서울시 대기오염전광판(시민에게 실시간 대기질을 안내하는 전광판) 설치 위치 정보를 조회한다.
+    (OA-15140 기반, 서비스명: airPollutionBrdInfo)
+    ※ 이 데이터셋은 대기질 수치(농도)가 아니라, 전광판이 어디에 설치되어 있는지를 알려주는
+    참고 정보이다. 각 행에 위도(YCRD)·경도(XCRD) 좌표가 포함되어 있어, 지도에 표시하거나
+    시민 안내 지점을 찾는 용도로 쓴다.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    ※ 이 데이터셋은 API 응답에 갱신일자 필드가 없는 정적 참고정보이므로, "_citation_required"
+    문장에는 실제 날짜 대신 "이 데이터셋에는 자동 갱신일자가 없다"는 사실과 원문 링크가
+    담겨 있다. 이 경우에도 문장을 임의로 바꾸거나 날짜를 지어내지 말고, 주어진 문장을
+    그대로 출력할 것.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        GU_NM: 구별(자치구명)
+        INSTL_PSTN: 설치위치 (도로명주소 등)
+        EXPRS_CN: 표출내용 (전광판이 표시하는 오염물질 종류, 예: "SO2,PM-10,PM-2.5,O3,NO2,CO")
+        YCRD: 위치좌표 (위도)
+        XCRD: 위치좌표 (경도)
+
+    Args:
+        district: 자치구 이름 (예: "중구"). 비워두면 전체 자치구.
+        location: 설치위치 문자열 검색 (예: "시청역"). 비워두면 전체.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "airPollutionBrdInfo", str(start), str(end)]
+    if district:
+        parts.append(district)
+        if location:
+            parts.append(location)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("airPollutionBrdInfo", {}).get("row", [])
+
+    if not district and location:
+        rows = [r for r in rows if location in r.get("INSTL_PSTN", "")]
+
+    citation = _citation("OA-15140", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
 
 
 @mcp.tool()
