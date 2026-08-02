@@ -58,6 +58,12 @@ _DATASET_INFO = {
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-2228/S/1/datasetView.do",
     },
+    "OA-12855": {
+        "dataset_name": "서울시 대기오염물질 측정소 높이 정보",
+        "dataset_id": "OA-12855",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-12855/S/1/datasetView.do",
+    },
 }
 
 
@@ -409,6 +415,49 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
     if warning:
         result["_data_quality_warning"] = warning
     return result
+
+
+@mcp.tool()
+async def get_station_height_info(station_name: str = "", start: int = 1, end: int = 40) -> dict:
+    """
+    서울시 대기오염물질 측정소별 채취구 높이 정보를 조회한다. (OA-12855 기반, 서비스명: airHgt)
+    ※ 이 데이터셋은 대기질 수치(농도) 자체가 아니라, 각 측정소의 채취구가 지상에서
+    얼마나 높은 곳에 설치되어 있는지를 알려주는 참고 정보이다. 측정값을 해석할 때
+    "이 수치가 지표면 근처 공기인지, 높은 곳 공기인지"를 감안하는 용도로 쓴다.
+
+    ⚠️ 중요: 이 도구로 얻은 정보로 답변할 때는 응답에 포함된 _data_source(데이터셋명·OA번호·원본 URL)를
+    반드시 답변 끝에 "출처: ..." 형태로 명시해야 한다. 생략하지 말 것.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        SEQ: 순서
+        MSRSTN_NM: 측정소명
+        ROAD_NM_ADDR: 도로명주소
+        MSRSTN_HGT: 채취구 높이 (m)
+        SE: 구분
+
+    Args:
+        station_name: 측정소명 (예: "종로구"). 비워두면 전체 측정소.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 40)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airHgt/{start}/{end}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("airHgt", {}).get("row", [])
+
+    if station_name:
+        rows = [r for r in rows if station_name in r.get("MSRSTN_NM", "")]
+
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": _source("OA-12855"),
+    }
 
 
 if __name__ == "__main__":
