@@ -3,14 +3,35 @@
 - 원본 데이터: 서울 열린데이터광장 (data.seoul.go.kr)
 - 담당부서: 서울특별시 기후환경본부 대기정책과
 
-인증키는 반드시 환경변수(SEOUL_API_KEY)로만 주입한다. 코드에 절대 하드코딩하지 않는다.
+인증키 주입 방식:
+  [필수] 쿼리 파라미터 방식 — 키 없이 접속하면 차단됨
+        https://서버주소/mcp?key={서울열린데이터광장API키}
+        예) https://seoul-air-quality-mcp.fly.dev/mcp?key=abc123xyz
+
+인증키는 코드에 절대 하드코딩하지 않는다.
 """
 
+import contextvars
 import os
-import httpx
-from fastmcp import FastMCP
 
-SEOUL_API_KEY = os.environ.get("SEOUL_API_KEY")
+import httpx
+import uvicorn
+from fastmcp import FastMCP
+from starlette.types import ASGIApp, Receive, Scope, Send
+
+# ─────────────────────────────────────────────────────────────
+# 요청별 API 키 — ?key=... 쿼리 파라미터에서 추출
+# ─────────────────────────────────────────────────────────────
+_request_api_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_api_key", default=""
+)
+
+
+def _get_api_key() -> str:
+    """현재 요청의 ?key= 쿼리 파라미터에서 추출한 API 키를 반환한다."""
+    return _request_api_key.get()
+
+
 BASE_URL = "http://openapi.seoul.go.kr:8088"
 
 mcp = FastMCP(
@@ -37,16 +58,74 @@ mcp = FastMCP(
 
 
 def _check_key():
-    if not SEOUL_API_KEY:
+    if not _get_api_key():
         raise RuntimeError(
-            "SEOUL_API_KEY 환경변수가 설정되지 않았습니다. "
-            "data.seoul.go.kr에서 발급받은 인증키를 환경변수로 등록하세요."
+            "API 키가 없습니다. URL에 ?key=본인키 를 붙여서 연결하세요.\n"
+            "연결 URL 형식: https://seoul-air-quality-mcp.fly.dev/mcp?key=본인서울API키\n"
+            "API 키 발급: https://data.seoul.go.kr (회원가입 후 인증키 관리 메뉴)"
         )
 
 
+# ─────────────────────────────────────────────────────────────
+# ?key=... 쿼리 파라미터에서 API 키를 추출하는 ASGI 미들웨어
+# 키가 없으면 HTTP 401로 차단 — 서버 비용 보호
+# ─────────────────────────────────────────────────────────────
+class APIKeyExtractorMiddleware:
+    """
+    모든 HTTP 요청의 ?key= 쿼리 파라미터에서 서울 API 키를 추출한다.
+    키가 없으면 HTTP 401 응답을 돌려보내고 서버(FastMCP)로 전달하지 않는다.
+
+    연결 URL 예시: https://seoul-air-quality-mcp.fly.dev/mcp?key=abc123xyz
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            # 쿼리 파라미터 파싱
+            query_string = scope.get("query_string", b"").decode("utf-8")
+            params: dict[str, str] = {}
+            for part in query_string.split("&"):
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    params[k.strip()] = v.strip()
+
+            api_key = params.get("key", "").strip()
+
+            if not api_key:
+                # API 키 없음 → 즉시 401 반환, FastMCP에 전달 안 함
+                body = (
+                    "❌ API 키가 필요합니다.\n\n"
+                    "연결 URL 형식:\n"
+                    "  https://seoul-air-quality-mcp.fly.dev/mcp?key=본인서울API키\n\n"
+                    "API 키 발급:\n"
+                    "  https://data.seoul.go.kr → 회원가입 → 인증키 관리\n"
+                ).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"text/plain; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+
+            # 키를 요청 컨텍스트에 저장 후 FastMCP로 전달
+            token = _request_api_key.set(api_key)
+            try:
+                await self.app(scope, receive, send)
+            finally:
+                _request_api_key.reset(token)
+            return
+
+        # HTTP 외(WebSocket 등)는 그대로 통과
+        await self.app(scope, receive, send)
+
+
 # 각 도구가 사용하는 원본 데이터셋 정보 (공무원 보고서 작성 시 출처 확인용)
-# 응답에 "_data_source" 필드로 함께 반환되어, 이 수치가 어느 데이터셋에서 나왔는지
-# 언제나 명확히 추적할 수 있도록 한다.
 _DATASET_INFO = {
     "OA-1200": {
         "dataset_name": "서울시 실시간 자치구별 대기환경 현황",
@@ -77,8 +156,6 @@ _DATASET_INFO = {
         "dataset_id": "OA-2228",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-2228/S/1/datasetView.do",
-        # 포털 데이터셋 상세페이지에 표기된 갱신일자(사람이 직접 확인해서 기록한 값).
-        # API 응답 자체에는 갱신일자가 없어서, 이 값은 자동 계산이 아니라 수동 확인값이다.
         "portal_last_verified": "2025-11-04 (확인일 2026-08-02 기준)",
     },
     "OA-12855": {
@@ -86,8 +163,6 @@ _DATASET_INFO = {
         "dataset_id": "OA-12855",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-12855/S/1/datasetView.do",
-        # 이 데이터셋은 API 응답에 측정일시/갱신일자 필드가 전혀 없는 정적 참고정보다.
-        # 기준일자를 자동으로 계산할 수 없으므로, 그 사실 자체를 응답에 명시한다.
         "static_reference_note": (
             "이 데이터셋은 실시간 측정값이 아닌 정적 참고정보(측정소 채취구 높이)이며, "
             "API 응답에 갱신일자 필드가 없습니다. 최신 여부는 원문 링크의 데이터셋 상세페이지에서 "
@@ -99,9 +174,6 @@ _DATASET_INFO = {
         "dataset_id": "OA-1201",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-1201/S/1/datasetView.do",
-        # 이 API는 매시간 갱신되지만(갱신주기: 정기/1시간단위), 응답 필드 자체에는
-        # 측정일시(MSRDT 등) 필드가 없다. 실제 측정시각을 알 수 없으므로 지어내지 않고,
-        # "조회 시점 기준"이라는 사실을 그대로 명시한다.
         "static_reference_note": (
             "이 데이터셋은 매시간 갱신되지만 API 응답에 측정일시 필드가 없습니다. "
             "따라서 아래 수치는 '조회한 시점 기준 최신값'이며, 정확한 측정시각이 필요하면 "
@@ -137,8 +209,6 @@ _DATASET_INFO = {
         "dataset_id": "OA-15140",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-15140/S/1/datasetView.do",
-        # 이 데이터셋은 대기질 측정값이 아니라 전광판 설치 위치(좌표 포함)를 알려주는
-        # 정적 참고정보다. API 응답에 갱신일자 필드가 없다.
         "static_reference_note": (
             "이 데이터셋은 실시간 측정값이 아닌 정적 참고정보(대기오염전광판 설치 위치·좌표)이며, "
             "API 응답에 갱신일자 필드가 없습니다. 최신 여부는 원문 링크의 데이터셋 상세페이지에서 "
@@ -150,8 +220,6 @@ _DATASET_INFO = {
         "dataset_id": "OA-16122",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-16122/S/1/datasetView.do",
-        # 대기질 측정값이 아니라 인허가/영업상태 스냅샷이다. 포털 설명상 "3일전 자료"를
-        # 제공하므로, 정확한 기준일자는 행별 LAST_MDFCN_YMD(최종수정일자)를 참고해야 한다.
         "static_reference_note": (
             "이 데이터셋은 대기질 수치가 아니라 사업장 인허가/영업상태 스냅샷이며, "
             "포털 설명에 따르면 3일 전 자료 기준으로 제공됩니다. 정확한 기준일자는 각 행의 "
@@ -161,14 +229,8 @@ _DATASET_INFO = {
     "OA-15515": {
         "dataset_name": "서울시 대기오염 측정항목 정보",
         "dataset_id": "OA-15515",
-        # 지금까지의 도구와 제공기관이 다르다: 대기정책과가 아니라 보건환경연구원
-        # 대기질통합분석센터가 제공하는 첫 데이터셋이다. 실측값을 다루는 다른 도구들과
-        # 절대 혼동되지 않도록 도구 설명·응답에서 항상 명확히 구분해서 표기한다.
         "provider": "서울특별시 보건환경연구원 대기질통합분석센터",
         "source_url": "https://data.seoul.go.kr/dataList/OA-15515/S/1/datasetView.do",
-        # 이 데이터셋은 실시간 측정값이 아니라 측정항목 코드 정의표(단위, 소수점자리수,
-        # 경보색상별 기준치 등)다. 행별 REG_DT(등록일시)는 있지만 "관측 시각"이 아니라
-        # "코드 등록 시각"이므로, 기준일자를 실측 데이터처럼 계산하지 않는다.
         "static_reference_note": (
             "이 데이터셋은 실시간 측정값이 아닌 측정항목 코드 정의표(단위·소수점자리수·"
             "경보색상별 기준치 등)이며, 다른 도구들과 제공기관도 다릅니다(보건환경연구원 "
@@ -181,9 +243,6 @@ _DATASET_INFO = {
         "dataset_id": "OA-15516",
         "provider": "서울특별시 보건환경연구원 대기질통합분석센터",
         "source_url": "https://data.seoul.go.kr/dataList/OA-15516/S/1/datasetView.do",
-        # 이 데이터셋은 측정값이 아니라 측정소명·주소·공인코드 등 정적 메타정보다.
-        # ⚠️ 좌표(X/Y, 위도/경도) 필드가 없다 — MSRSTN_ADDR(주소, 텍스트)만 제공된다.
-        # 지도 시각화가 필요하면 이 주소를 카카오맵 등 지오코딩 API로 별도 변환해야 한다.
         "static_reference_note": (
             "이 데이터셋은 실시간 측정값이 아닌 측정소 메타정보(측정소명·주소·공인코드)이며, "
             "제공기관은 보건환경연구원 대기질통합분석센터입니다. 이 데이터셋에는 좌표(위도/경도) "
@@ -195,29 +254,19 @@ _DATASET_INFO = {
         "dataset_id": "OA-15526",
         "provider": "서울특별시 보건환경연구원 대기질통합분석센터",
         "source_url": "https://data.seoul.go.kr/dataList/OA-15526/S/1/datasetView.do",
-        # ⚠️ 이 데이터셋은 각 자치구 측정소 결과를 매시 5분마다 바로 보정해서 제공하는
-        # "실시간 잠정치"다. 국가(환경부/에어코리아) 사후검증을 거친 확정치가 아니므로,
-        # 도구 응답에 "_data_tier" 필드로 이 사실을 별도 명시한다 (사용자 지정 설계 원칙:
-        # 잠정치와 국가검증 확정치를 도구명·설명·응답 메타데이터 세 층위에서 구분할 것).
     },
     "OA-1256": {
         "dataset_name": "서울시 굴뚝 측정 정보",
         "dataset_id": "OA-1256",
-        # 지금까지의 두 제공기관(대기정책과, 보건환경연구원 대기질통합분석센터)과 또 다르다.
-        # 이 데이터셋은 자원회수시설(소각장) 배출 감시가 목적이므로 담당 부서도 다르다.
         "provider": "서울특별시 기후환경본부 자원회수시설추진단 자원회수시설과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-1256/S/1/datasetView.do",
-        # ⚠️ 배출허용기준(법적 한도) 필드가 없다 — 실측값(MSRMT_VL)만 제공한다.
-        # 기준 초과 여부는 이 데이터만으로 판단할 수 없으므로 도구 docstring에서 별도 강조.
     },
 }
 
-# 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
 _DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE", "MSRMT_YMD", "MSRMT_MM"]
 
 
 def _format_msrdt(raw: str) -> str:
-    """'YYYYMMDDHHMM' 또는 'YYYYMMDDHH', 'YYYYMMDD', 'YYYYMM' 형식의 문자열을 사람이 읽기 좋은 형태로 바꾼다."""
     s = str(raw)
     try:
         if len(s) >= 12:
@@ -234,7 +283,6 @@ def _format_msrdt(raw: str) -> str:
 
 
 def _latest_reference_datetime(rows: list) -> str | None:
-    """행 데이터에 측정일시 필드가 있으면, 그 중 가장 최신 값을 '기준일자'로 계산해 반환한다."""
     values = []
     for r in rows:
         for field in _DATETIME_FIELD_CANDIDATES:
@@ -247,18 +295,6 @@ def _latest_reference_datetime(rows: list) -> str | None:
 
 
 def _citation(dataset_id: str, rows: list | None = None, year_field: str | None = None) -> dict:
-    """
-    출처(_data_source)와, 답변 끝에 그대로 출력해야 하는 완성 문장(_citation_required)을 생성한다.
-
-    기준일자 결정 순서:
-    1. rows에 측정일시 필드(MSRDT 등)가 있으면 → 그 중 최신값을 기준일자로 사용 (실시간/시간평균류)
-    2. year_field가 지정되어 있으면 → 조회된 연도 범위를 기준일자로 사용 (연도별 통계류)
-    3. 둘 다 없으면 → _DATASET_INFO의 static_reference_note를 기준일자 자리에 사용
-       (=API에 갱신일자 정보 자체가 없다는 사실을 그대로 답변에 노출시킨다. 임의로 날짜를 지어내지 않는다.)
-
-    이 함수가 반환하는 "citation_text"는 반드시 답변 맨 끝에 그대로("출처: ..." 문장 전체) 포함해야 한다.
-    생략, 요약, 재구성 금지.
-    """
     info = dict(_DATASET_INFO.get(
         dataset_id,
         {"dataset_name": "미등록 데이터셋", "dataset_id": dataset_id,
@@ -294,15 +330,9 @@ def _citation(dataset_id: str, rows: list | None = None, year_field: str | None 
 
 
 def _source(dataset_id: str) -> dict:
-    """하위호환용. 새 도구는 _citation()을 사용할 것."""
     return _citation(dataset_id)
 
 
-# 농도값(PM10/PM2.5/오존 등)을 반환하는 도구들에 공통으로 붙는 경고문구.
-# 측정소 채취구 높이가 지상보다 높은 경우, 실제 보행자가 지표면 근처에서 체감하는
-# 농도와 차이가 날 수 있다는 대표성 한계를 항상 명시한다.
-# (공무원 보고서 작성 시 "이 수치를 그대로 인용해도 되는지"를 즉시 판단할 수 있도록,
-#  선택 정보가 아니라 응답에 항상 포함되는 기본 정보로 취급한다.)
 _HEIGHT_CAVEAT = (
     "⚠️ 대표성 참고: 각 측정소 행의 station_intake_height_m(채취구 높이, m 단위 실측값)과 "
     "station_location_address(측정소 위치)를 함께 확인하세요. '높다/낮다'로 뭉뚱그리지 말고, "
@@ -312,17 +342,9 @@ _HEIGHT_CAVEAT = (
 
 
 async def _get_station_heights() -> dict:
-    """
-    측정소 채취구 높이 정보(OA-12855, 서비스명 airHgt)를 조회해
-    측정소명 → {height_m, address, category} 매핑으로 반환한다.
-
-    농도값을 반환하는 도구들이 "높다/낮다" 같은 뭉뚱그린 표현 대신, 실제 수치(m)와
-    위치를 응답에 직접 병합하기 위해 내부적으로 호출한다. 조회 실패 시에도 전체 응답이
-    깨지지 않도록 빈 dict를 반환한다(농도 조회 자체는 항상 성공해야 하므로).
-    """
     try:
         _check_key()
-        url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airHgt/1/100/"
+        url = f"{BASE_URL}/{_get_api_key()}/json/airHgt/1/100/"
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(url)
             resp.raise_for_status()
@@ -344,11 +366,6 @@ async def _get_station_heights() -> dict:
 
 
 def _attach_station_info(rows: list, heights: dict, station_field: str = "MSRSTN_NM") -> list:
-    """
-    각 행에 실제 채취구 높이(station_intake_height_m, m)와 측정소 위치(station_location_address)를 붙인다.
-    이름이 정확히 일치하지 않으면 부분일치(포함 관계)로 한 번 더 시도한다.
-    매칭되는 정보가 없으면 그 사실 자체를 필드에 명시한다(값을 비워서 조용히 생략하지 않는다).
-    """
     for r in rows:
         name = str(r.get(station_field, "")).strip()
         info = heights.get(name)
@@ -367,13 +384,10 @@ def _attach_station_info(rows: list, heights: dict, station_field: str = "MSRSTN
 
 
 def _with_height_caveat(result: dict) -> dict:
-    """농도값 반환 도구의 응답에 채취구 높이 대표성 경고문구를 항상 붙인다. 생략 금지."""
     result["_measurement_representativeness"] = _HEIGHT_CAVEAT
     return result
 
 
-# 통합대기환경지수(CAI) 산정 기준 (환경부 공식 등급기준)
-# 형식: (구간최솟값, 구간최댓값, 지수최솟값, 지수최댓값)
 _CAI_BREAKPOINTS = {
     "PM10": [(0, 30, 0, 50), (31, 80, 51, 100), (81, 150, 101, 250), (151, 600, 251, 500)],
     "PM25": [(0, 15, 0, 50), (16, 35, 51, 100), (36, 75, 101, 250), (76, 500, 251, 500)],
@@ -404,7 +418,6 @@ def _grade_from_index(index: float) -> str:
 
 
 def _pollutant_subindex(pollutant: str, value) -> float | None:
-    """개별 오염물질 농도를 환경부 CAI 세부지수로 환산한다."""
     try:
         v = float(value)
     except (TypeError, ValueError):
@@ -426,11 +439,6 @@ def _pollutant_subindex(pollutant: str, value) -> float | None:
 
 
 def _add_air_quality_grade(row: dict) -> dict:
-    """
-    측정 데이터에 PM10/PM2.5/오존/이산화질소/일산화탄소/아황산가스 값이 있으면
-    통합대기환경지수(CAI)를 직접 계산하여 등급·지배오염물질·행동요령을 함께 붙여준다.
-    (원본 API가 지수를 따로 제공하지 않거나 값이 비어 있는 경우에도 항상 동일한 기준으로 계산한다.)
-    """
     subindices = {}
     for pollutant, field in _CAI_FIELD_MAP.items():
         idx = _pollutant_subindex(pollutant, row.get(field))
@@ -457,31 +465,17 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     서울시 25개 자치구의 실시간 대기환경 현황을 조회한다. (OA-1200 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    각 자치구 데이터에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있어, 단순히 원시 수치를 해석하지 않아도
-    바로 활동 여부를 판단할 수 있다.
+    ⚠️ 필수(생략 불가): 각 행의 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라.
 
     Args:
         district: 자치구 이름 (예: "강남구"). 비워두면 전체 자치구 반환.
         start: 조회 시작 인덱스 (기본 1)
-        end: 조회 종료 인덱스 (기본 25, 전체 자치구 수)
+        end: 조회 종료 인덱스 (기본 25)
     """
     _check_key()
-    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/RealtimeCityAir/{start}/{end}/"
+    url = f"{BASE_URL}/{_get_api_key()}/json/RealtimeCityAir/{start}/{end}/"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -489,12 +483,10 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
         data = resp.json()
 
     rows = data.get("RealtimeCityAir", {}).get("row", [])
-
     if district:
         rows = [r for r in rows if district in r.get("MSRSTN_NM", "")]
 
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -510,44 +502,19 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
 @mcp.tool()
 async def get_seoul_average_air_quality(cai_grade: str = "", start: int = 1, end: int = 5) -> dict:
     """
-    서울시 25개 자치구의 대기환경정보 측정수치를 합산·평균낸 "서울시 전체 평균" 현황을 조회한다.
+    서울시 25개 자치구의 대기환경정보를 합산·평균낸 "서울시 전체 평균" 현황을 조회한다.
     (OA-1201 기반, 서비스명: ListAvgOfSeoulAirQualityService)
 
-    ※ 자치구별/측정소별 개별 수치가 아니라, 서울시 전체를 하나의 값으로 합산한 도시 단위
-    지표이다. 특정 자치구나 측정소의 수치가 필요하면 이 도구 대신 get_realtime_air_quality를
-    사용할 것. 이 둘을 혼동해서 "서울시 평균"을 "특정 자치구 수치"인 것처럼 답변하지 말 것.
-
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    ※ 이 API 응답에는 측정일시 필드가 없다. "_citation_required" 문장에는 실제 측정시각
-    대신 "조회 시점 기준" 안내문이 이미 담겨 있으니, 임의로 시각을 지어내지 말고 그 문장을
-    그대로 출력할 것.
-
-    ※ 이 데이터셋은 통합대기환경지수(CAI)와 등급(CAI_GRD), 지배오염물질(CRST_SBSTN)을
-    서울시가 자체적으로 이미 계산해 제공한다. 다른 도구(get_realtime_air_quality 등)처럼
-    Claude가 개별 오염물질 값으로 CAI를 다시 계산하지 않고, 원본 값을 그대로 사용하고
-    인용할 것 (중복 계산으로 인한 값 불일치 방지).
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        CAI_GRD: 통합대기환경지수 등급 (좋음/보통/나쁨/매우나쁨)
-        CAI: 통합대기환경지수 (수치)
-        CRST_SBSTN: 지수를 결정한 오염물질명
-        NTDX: 이산화질소 평균 (ppm)
-        OZON: 오존 평균 (ppm)
-        CBMX: 일산화탄소 평균 (ppm)
-        SPDX: 아황산가스 평균 (ppm)
-        PM: 미세먼지 PM10 평균 (μg/m³)
-        FPM: 초미세먼지 PM2.5 평균 (μg/m³)
-
-    각 행에는 CAI_GRD 값에 대응하는 cai_guidance(야외활동 행동요령 안내문)가 함께 담겨 있다.
 
     Args:
-        cai_grade: 통합대기환경지수 등급으로 필터링 (예: "좋음", "보통", "나쁨", "매우나쁨"). 비워두면 전체.
+        cai_grade: 통합대기환경지수 등급으로 필터링 (예: "좋음", "보통", "나쁨", "매우나쁨").
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 5)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "ListAvgOfSeoulAirQualityService", str(start), str(end)]
+    parts = [BASE_URL, _get_api_key(), "json", "ListAvgOfSeoulAirQualityService", str(start), str(end)]
     if cai_grade:
         parts.append(cai_grade)
     url = "/".join(parts) + "/"
@@ -558,7 +525,6 @@ async def get_seoul_average_air_quality(cai_grade: str = "", start: int = 1, end
         data = resp.json()
 
     rows = data.get("ListAvgOfSeoulAirQualityService", {}).get("row", [])
-
     for r in rows:
         grade = r.get("CAI_GRD")
         if grade in _GRADE_GUIDANCE:
@@ -581,45 +547,20 @@ async def get_hourly_air_quality(
     특정 날짜(또는 특정 시)의 자치구별 시간평균 대기오염도를 조회한다. (OA-2275 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_DT: 측정일시 (YYYYMMDDHH)
-        MSRSTN_NM: 측정소명(자치구명)
-        NTDX: 이산화질소 농도 (ppm)
-        OZON: 오존 농도 (ppm)
-        CBMX: 일산화탄소 농도 (ppm)
-        SPDX: 아황산가스 농도 (ppm)
-        PM: 미세먼지 PM10 (μg/m³)
-        FPM: 초미세먼지 PM2.5 (μg/m³)
-
-    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
+    ⚠️ 필수(생략 불가): 각 행의 station_intake_height_m과 station_location_address를 표시하라.
 
     Args:
         date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801")
-        hour: 특정 시(00~23)를 지정하려면 두 자리 숫자로 (예: "13"). 비워두면 해당 날짜의 전체 시간대 조회.
-        district: 자치구 이름 (예: "종로구"). 비워두면 서울시 전체 자치구.
+        hour: 특정 시(00~23) 두 자리 숫자로 (예: "13"). 비워두면 해당 날짜의 전체 시간대 조회.
+        district: 자치구 이름 (예: "종로구"). 비워두면 서울시 전체.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
+    date_param = date + hour
 
-    date_param = date + hour  # hour가 있으면 YYYYMMDDHH, 없으면 YYYYMMDD
-
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "TimeAverageAirQuality", str(start), str(end), date_param]
+    parts = [BASE_URL, _get_api_key(), "json", "TimeAverageAirQuality", str(start), str(end), date_param]
     if district:
         parts.append(district)
     url = "/".join(parts) + "/"
@@ -631,7 +572,6 @@ async def get_hourly_air_quality(
 
     rows = data.get("TimeAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -650,47 +590,20 @@ async def get_roadside_air_quality(
 ) -> dict:
     """
     서울시 도로변/입체대기 측정소별 실시간 대기환경 현황을 조회한다. (OA-2223 기반)
-    ※ 자치구 도시대기측정망과는 별도로, 도로변(일반도로/전용차로/중앙차로)에 설치된
-    측정소에서 측정한 값이며 최종검증 전 실시간(잠정치) 자료이다.
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_DT: 측정일시
-        ROAD: 도로변구분 (일반도로/전용차로/중앙차로)
-        MSRSTN_NM: 측정소명
-        PM: 미세먼지 PM10 (μg/m³)
-        OZON: 오존 농도 (ppm)
-        NTDX: 이산화질소 농도 (ppm)
-        CBMX: 일산화탄소 농도 (ppm)
-        SPDX: 아황산가스 농도 (ppm)
-        FPM: 초미세먼지 PM2.5 (μg/m³)
-
-    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
+    ⚠️ 필수(생략 불가): 각 행의 station_intake_height_m과 station_location_address를 표시하라.
 
     Args:
         road: 도로변구분 (예: "일반도로", "전용차로", "중앙차로"). 비워두면 전체.
-        station_name: 측정소명 (예: "서울역"). 비워두면 전체 측정소.
+        station_name: 측정소명 (예: "서울역"). 비워두면 전체.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 25)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "RealtimeRoadsideStation", str(start), str(end)]
+    parts = [BASE_URL, _get_api_key(), "json", "RealtimeRoadsideStation", str(start), str(end)]
     if road:
         parts.append(road)
     if station_name:
@@ -704,7 +617,6 @@ async def get_roadside_air_quality(
 
     rows = data.get("RealtimeRoadsideStation", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -722,51 +634,21 @@ async def get_roadside_daily_air_quality(
     date: str = "", road: str = "", station_name: str = "", start: int = 1, end: int = 25
 ) -> dict:
     """
-    서울시 도로변/입체대기 측정소별 일평균 대기환경 현황을 조회한다. (OA-2224 기반, 서비스명: DailyAverageRoadside)
-    ※ get_roadside_air_quality(OA-2223, 실시간)의 "하루 단위 평균" 버전이다.
-
-    ⚠️ 위치(positional) 기반 API라서, road나 station_name으로 필터링하려면 date도
-    반드시 함께 지정해야 한다. date 없이 road/station_name만 넘기면 API가 그 값을
-    날짜 자리로 잘못 해석해 오류가 날 수 있다.
+    서울시 도로변/입체대기 측정소별 일평균 대기환경 현황을 조회한다. (OA-2224 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(조회한 날짜)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_YMD: 측정일자 (YYYYMMDD)
-        ROAD_SE: 도로변구분 (일반도로/전용차로/중앙차로)
-        MSRSTN_NM: 측정소명
-        PM: 미세먼지 일평균 (μg/m³)
-        OZON: 오존 일평균 (ppm)
-        NTDX: 이산화질소 일평균 (ppm)
-        CBMX: 일산화탄소 일평균 (ppm)
-        SPDX: 아황산가스 일평균 (ppm)
-
-    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
 
     Args:
-        date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801"). road나 station_name을 쓰려면 필수.
-        road: 도로변구분 (예: "일반도로", "전용차로", "중앙차로"). date와 함께 지정할 것.
+        date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801"). road/station_name을 쓰려면 필수.
+        road: 도로변구분 (예: "일반도로"). date와 함께 지정할 것.
         station_name: 측정소명 (예: "서울역"). date와 함께 지정할 것.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 25)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "DailyAverageRoadside", str(start), str(end)]
+    parts = [BASE_URL, _get_api_key(), "json", "DailyAverageRoadside", str(start), str(end)]
     if date:
         parts.append(date)
         if road:
@@ -782,7 +664,6 @@ async def get_roadside_daily_air_quality(
 
     rows = data.get("DailyAverageRoadside", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -800,61 +681,23 @@ async def get_zonal_hourly_air_quality(
     date: str, hour: str, sarea: str = "", station_name: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    특정 날짜·시각의 권역별/측정소별 시간평균 대기환경 정보를 조회한다. (OA-2221 기반, 서비스명: TimeAverageCityAir)
-    ※ 데이터셋 이름은 "기간별"이지만 실제로는 여러 날짜를 한 번에 조회하는 것이 아니라,
-    지정한 "특정 한 시각"의 데이터를 조회하는 API이다. 여러 시각을 보려면 이 도구를 반복 호출해야 한다.
+    특정 날짜·시각의 권역별/측정소별 시간평균 대기환경 정보를 조회한다. (OA-2221 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    ⚠️ 시간(hour) 표기가 get_hourly_air_quality(00~23)와 다르다. 이 API는 01~24이며,
-    24는 해당 날짜의 마지막 시간(자정)을 의미한다. 헷갈리지 않도록 주의할 것.
-
-    자치구 단위가 아니라 권역(SAREA_NM, 예: 도심권/서북권/동북권/서남권/동남권) 단위로 묶여서 나오며,
-    기존 도구에는 없는 미세먼지 24시간 평균값(PM_ALDY)도 함께 제공한다.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_DT: 측정일시
-        SAREA_CD: 권역코드
-        SAREA_NM: 권역명
-        MSRSTN_CD: 측정소코드
-        MSRSTN_NM: 측정소명
-        PM_HOUR: 미세먼지 1시간 평균 (μg/m³)
-        PM_ALDY: 미세먼지 24시간 평균 (μg/m³)
-        FPM: 초미세먼지 (μg/m³)
-        OZON: 오존 농도 (ppm)
-        NTDX: 이산화질소 농도 (ppm)
-        CBMX: 일산화탄소 농도 (ppm)
-        SPDX: 아황산가스 농도 (ppm)
-
-    각 행에는 PM_HOUR(1시간 평균)를 기준으로 환경부 통합대기환경지수(CAI)를 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
 
     Args:
         date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801")
-        hour: 시(01~24) 두 자리 숫자로 (예: "11"). 24는 해당 날짜의 마지막 시간을 의미.
-        sarea: 권역명 (예: "도심권", "서북권", "동북권", "서남권", "동남권"). 비워두면 전체 권역.
-        station_name: 측정소명 (예: "종로구"). 비워두면 전체 측정소.
+        hour: 시(01~24) 두 자리 숫자로 (예: "11"). 24는 해당 날짜의 마지막 시간.
+        sarea: 권역명 (예: "도심권", "서북권", "동북권", "서남권", "동남권").
+        station_name: 측정소명 (예: "종로구").
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
+    msrmt_dt = date + hour + "00"
 
-    msrmt_dt = date + hour + "00"  # YYYYMMDDHHMM, 분은 항상 00
-
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "TimeAverageCityAir", str(start), str(end), msrmt_dt]
+    parts = [BASE_URL, _get_api_key(), "json", "TimeAverageCityAir", str(start), str(end), msrmt_dt]
     if sarea:
         parts.append(sarea)
     if station_name:
@@ -871,16 +714,15 @@ async def get_zonal_hourly_air_quality(
     graded_rows = []
     for r in rows:
         r_for_grade = dict(r)
-        r_for_grade["PM"] = r.get("PM_HOUR")  # CAI 계산용: 1시간 평균값을 PM10 기준으로 사용
+        r_for_grade["PM"] = r.get("PM_HOUR")
         r_for_grade = _add_air_quality_grade(r_for_grade)
-        r_for_grade.pop("PM", None)  # 원본 응답에 없던 임시 필드는 제거
+        r_for_grade.pop("PM", None)
         graded_rows.append(r_for_grade)
-
-    citation = _citation("OA-2221", rows=rows)
 
     heights = await _get_station_heights()
     graded_rows = _attach_station_info(graded_rows, heights)
 
+    citation = _citation("OA-2221", rows=rows)
     return _with_height_caveat({
         "count": len(graded_rows),
         "data": graded_rows,
@@ -894,51 +736,20 @@ async def get_zonal_daily_air_quality(
     date: str, sarea: str = "", station_name: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    특정 날짜의 권역별/측정소별 일평균 대기환경 정보를 조회한다. (OA-2220 기반, 서비스명: DailyAverageCityAir)
-    ※ get_zonal_hourly_air_quality(OA-2221, 시간평균)의 "하루 단위" 버전이다. 시간별 변화가
-    아니라 그 날 하루 전체의 평균값이 필요할 때 이 도구를 사용할 것.
+    특정 날짜의 권역별/측정소별 일평균 대기환경 정보를 조회한다. (OA-2220 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(조회한 날짜)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
-    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    자치구 단위가 아니라 권역(SAREA_NM, 예: 도심권/서북권/동북권/서남권/동남권) 단위로 묶여서 나온다.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_YMD: 측정일자 (YYYYMMDD)
-        SAREA_NM: 권역명
-        MSRSTN_NM: 측정소명
-        PM: 미세먼지 일평균 (μg/m³)
-        FPM: 초미세먼지 일평균 (μg/m³)
-        OZON: 오존 일평균 (ppm)
-        NTDX: 이산화질소 일평균 (ppm)
-        CBMX: 일산화탄소 일평균 (ppm)
-        SPDX: 아황산가스 일평균 (ppm)
-
-    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
 
     Args:
         date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801")
-        sarea: 권역명 (예: "도심권", "서북권", "동북권", "서남권", "동남권"). 비워두면 전체 권역.
-        station_name: 측정소명 (예: "강남구"). 비워두면 전체 측정소.
+        sarea: 권역명 (예: "도심권", "서북권", "동북권", "서남권", "동남권").
+        station_name: 측정소명.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "DailyAverageCityAir", str(start), str(end), date]
+    parts = [BASE_URL, _get_api_key(), "json", "DailyAverageCityAir", str(start), str(end), date]
     if sarea:
         parts.append(sarea)
     if station_name:
@@ -952,7 +763,6 @@ async def get_zonal_daily_air_quality(
 
     rows = data.get("DailyAverageCityAir", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -968,50 +778,19 @@ async def get_zonal_daily_air_quality(
 @mcp.tool()
 async def get_daily_air_quality(date: str, station_name: str = "", start: int = 1, end: int = 100) -> dict:
     """
-    특정 날짜의 측정소별(자치구 측정소 + 도로변 측정소 포함) 일평균 대기오염도 정보를 조회한다.
-    (OA-2218 기반, 서비스명: DailyAverageAirQuality)
-    ※ get_hourly_air_quality(OA-2275, 시간평균)의 "하루 단위" 버전이다. 시간별 변화가 아니라
-    그 날 하루 전체의 평균값이 필요할 때 이 도구를 사용할 것.
-    ※ get_zonal_daily_air_quality(OA-2220)와 달리 권역(SAREA_NM) 구분이 없고, 개별 측정소명
-    (자치구명 또는 도로변 측정소명)으로만 조회된다.
+    특정 날짜의 측정소별 일평균 대기오염도 정보를 조회한다. (OA-2218 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(조회한 날짜)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
-    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_DT: 측정일자 (YYYYMMDD)
-        MSRSTN_NM: 측정소명 (자치구명 또는 도로변 측정소명)
-        NTDX: 이산화질소 일평균 (ppm)
-        OZON: 오존 일평균 (ppm)
-        CBMX: 일산화탄소 일평균 (ppm)
-        SPDX: 아황산가스 일평균 (ppm)
-        PM: 미세먼지 일평균 (μg/m³)
-        FPM: 초미세먼지 일평균 (μg/m³)
-
-    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
 
     Args:
         date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801")
-        station_name: 측정소명 (예: "강남구", "강변북로"). 비워두면 전체 측정소.
+        station_name: 측정소명 (예: "강남구"). 비워두면 전체.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "DailyAverageAirQuality", str(start), str(end), date]
+    parts = [BASE_URL, _get_api_key(), "json", "DailyAverageAirQuality", str(start), str(end), date]
     if station_name:
         parts.append(station_name)
     url = "/".join(parts) + "/"
@@ -1023,7 +802,6 @@ async def get_daily_air_quality(date: str, station_name: str = "", start: int = 
 
     rows = data.get("DailyAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -1039,48 +817,19 @@ async def get_daily_air_quality(date: str, station_name: str = "", start: int = 
 @mcp.tool()
 async def get_monthly_air_quality(month: str, station_name: str = "", start: int = 1, end: int = 100) -> dict:
     """
-    특정 월의 측정소별(자치구 측정소 + 도로변 측정소 포함) 월평균 대기오염도 정보를 조회한다.
-    (OA-2217 기반, 서비스명: MonthlyAverageAirQuality)
-    ※ get_daily_air_quality(OA-2218, 일평균)보다 더 긴 기간(한 달 전체)을 하나의 평균값으로
-    묶어서 보여준다. 특정 날짜가 아니라 "이번 달 전체적으로" 같은 질문에 적합하다.
+    특정 월의 측정소별 월평균 대기오염도 정보를 조회한다. (OA-2217 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(조회한 월)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
-
-    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
-    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
-    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
-
-    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
-    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
-    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
-    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
-    명시해야 한다(조용히 생략 금지).
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_MM: 측정월 (YYYYMM)
-        MSRSTN_NM: 측정소명 (자치구명 또는 도로변 측정소명)
-        NTDX: 이산화질소 월평균 (ppm)
-        OZON: 오존 월평균 (ppm)
-        CBMX: 일산화탄소 월평균 (ppm)
-        SPDX: 아황산가스 월평균 (ppm)
-        PM: 미세먼지 월평균 (μg/m³)
-        FPM: 초미세먼지 월평균 (μg/m³)
-
-    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
-    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
-    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
 
     Args:
         month: 조회할 월, YYYYMM 형식 (예: "202608")
-        station_name: 측정소명 (예: "강남구", "강변북로"). 비워두면 전체 측정소.
+        station_name: 측정소명 (예: "강남구"). 비워두면 전체.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "MonthlyAverageAirQuality", str(start), str(end), month]
+    parts = [BASE_URL, _get_api_key(), "json", "MonthlyAverageAirQuality", str(start), str(end), month]
     if station_name:
         parts.append(station_name)
     url = "/".join(parts) + "/"
@@ -1092,7 +841,6 @@ async def get_monthly_air_quality(month: str, station_name: str = "", start: int
 
     rows = data.get("MonthlyAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
@@ -1110,34 +858,19 @@ async def get_air_pollution_board_locations(
     district: str = "", location: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    서울시 대기오염전광판(시민에게 실시간 대기질을 안내하는 전광판) 설치 위치 정보를 조회한다.
-    (OA-15140 기반, 서비스명: airPollutionBrdInfo)
-    ※ 이 데이터셋은 대기질 수치(농도)가 아니라, 전광판이 어디에 설치되어 있는지를 알려주는
-    참고 정보이다. 각 행에 위도(YCRD)·경도(XCRD) 좌표가 포함되어 있어, 지도에 표시하거나
-    시민 안내 지점을 찾는 용도로 쓴다.
+    서울시 대기오염전광판 설치 위치 정보를 조회한다. (OA-15140 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    ※ 이 데이터셋은 API 응답에 갱신일자 필드가 없는 정적 참고정보이므로, "_citation_required"
-    문장에는 실제 날짜 대신 "이 데이터셋에는 자동 갱신일자가 없다"는 사실과 원문 링크가
-    담겨 있다. 이 경우에도 문장을 임의로 바꾸거나 날짜를 지어내지 말고, 주어진 문장을
-    그대로 출력할 것.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        GU_NM: 구별(자치구명)
-        INSTL_PSTN: 설치위치 (도로명주소 등)
-        EXPRS_CN: 표출내용 (전광판이 표시하는 오염물질 종류, 예: "SO2,PM-10,PM-2.5,O3,NO2,CO")
-        YCRD: 위치좌표 (위도)
-        XCRD: 위치좌표 (경도)
 
     Args:
-        district: 자치구 이름 (예: "중구"). 비워두면 전체 자치구.
-        location: 설치위치 문자열 검색 (예: "시청역"). 비워두면 전체.
+        district: 자치구 이름 (예: "중구"). 비워두면 전체.
+        location: 설치위치 문자열 검색 (예: "시청역").
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
 
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "airPollutionBrdInfo", str(start), str(end)]
+    parts = [BASE_URL, _get_api_key(), "json", "airPollutionBrdInfo", str(start), str(end)]
     if district:
         parts.append(district)
         if location:
@@ -1150,7 +883,6 @@ async def get_air_pollution_board_locations(
         data = resp.json()
 
     rows = data.get("airPollutionBrdInfo", {}).get("row", [])
-
     if not district and location:
         rows = [r for r in rows if location in r.get("INSTL_PSTN", "")]
 
@@ -1168,53 +900,20 @@ async def get_air_pollutant_emission_facilities(
     district: str = "", business_name: str = "", status: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    서울시 대기오염물질배출시설설치사업장의 인허가·영업상태 정보를 조회한다.
-    (OA-16122 기반, 서비스명: LOCALDATA_093008, 행정안전부 지방행정인허가데이터 표준 서식)
+    서울시 대기오염물질배출시설설치사업장의 인허가·영업상태 정보를 조회한다. (OA-16122 기반)
 
-    ※ 이 도구는 대기질 "수치"가 아니라, 대기오염물질을 배출하는 "사업장" 자체의 인허가·영업
-    현황을 알려준다. 활용 예: 특정 지역의 대기질이 나쁠 때, 그 지역에 어떤 배출사업장이
-    있는지 찾아 현장 점검 대상 후보를 추리는 용도.
-
-    ⚠️ 필수(생략 불가) — 좌표계 경고: XCRD/YCRD는 위도·경도가 아니라 중부원점TM(EPSG:5174)
-    좌표계의 평면좌표다. 지도 서비스(구글맵 등)에 위도/경도인 것처럼 그대로 입력하면 완전히
-    엉뚱한 위치가 표시된다. 지도에 표시하려면 반드시 좌표변환(EPSG:5174 → WGS84)을 거쳐야
-    한다는 사실을 답변에 명시할 것. 주소(LOTNO_ADDR 지번주소, ROAD_NM_ADDR 도로명주소)는
-    변환 없이 바로 사용 가능하다.
-
-    ⚠️ 이 API는 자치구·상태로 서버에서 걸러주는 파라미터가 없다(요청인자에 KEY/TYPE/SERVICE/
-    START_INDEX/END_INDEX만 있음). 그래서 이 도구는 넉넉히 데이터를 받아온 뒤 Python에서
-    직접 필터링한다 — district/business_name/status로 원하는 결과가 안 보이면, start/end
-    범위를 늘려서 더 많은 사업장을 조회해야 할 수 있다(전체 사업장 수가 많을 수 있음).
-
+    ⚠️ XCRD/YCRD는 위도·경도가 아니라 중부원점TM(EPSG:5174) 좌표계다. 지도에 표시하려면 WGS84로 변환 필요.
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    ※ 이 데이터셋은 대기질 실시간 수치가 아니라 인허가 스냅샷(포털 설명상 3일 전 자료)이므로,
-    "_citation_required" 문장에는 실제 측정시각 대신 이 사실과 원문 링크가 담겨 있다. 이
-    경우에도 문장을 임의로 바꾸지 말고 그대로 출력할 것. 개별 사업장의 정확한 기준일자가
-    필요하면 그 행의 LAST_MDFCN_YMD(최종수정일자)를 함께 안내할 것.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인, 주요 필드만):
-        BPLC_NM: 사업장명
-        LOTNO_ADDR / ROAD_NM_ADDR: 지번주소 / 도로명주소
-        SALS_STTS_NM: 영업상태명 (영업/폐업/휴업 등)
-        DTL_SALS_STTS_NM: 상세영업상태명
-        LCPMT_YMD: 인허가일자
-        CLSBIZ_YMD: 폐업일자
-        TELNO: 전화번호
-        CTGRY_NM: 종별명 (배출시설 종류)
-        MAIN_PRDT_NM: 주생산품명
-        XCRD / YCRD: 위치좌표 (TM좌표, 위경도 아님 — 위 경고 참고)
-        LAST_MDFCN_YMD: 최종수정일자
-        DATA_UPDT_YMD: 데이터갱신일자
 
     Args:
-        district: 주소에 포함될 자치구/지역명으로 필터링 (예: "강남구"). 비워두면 전체.
-        business_name: 사업장명에 포함될 문자열로 필터링 (예: "OO공장"). 비워두면 전체.
-        status: 영업상태명으로 필터링 (예: "영업", "폐업", "휴업"). 비워두면 전체.
+        district: 주소에 포함될 자치구/지역명 (예: "강남구").
+        business_name: 사업장명에 포함될 문자열 (예: "OO공장").
+        status: 영업상태명 (예: "영업", "폐업", "휴업").
         start: 조회 시작 인덱스 (기본 1)
-        end: 조회 종료 인덱스 (기본 100, 한 번에 최대 1000까지 가능)
+        end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
-    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/LOCALDATA_093008/{start}/{end}/"
+    url = f"{BASE_URL}/{_get_api_key()}/json/LOCALDATA_093008/{start}/{end}/"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -1224,10 +923,7 @@ async def get_air_pollutant_emission_facilities(
     rows = data.get("LOCALDATA_093008", {}).get("row", [])
 
     if district:
-        rows = [
-            r for r in rows
-            if district in r.get("LOTNO_ADDR", "") or district in r.get("ROAD_NM_ADDR", "")
-        ]
+        rows = [r for r in rows if district in r.get("LOTNO_ADDR", "") or district in r.get("ROAD_NM_ADDR", "")]
     if business_name:
         rows = [r for r in rows if business_name in r.get("BPLC_NM", "")]
     if status:
@@ -1250,23 +946,18 @@ async def get_air_pollutant_emission_facilities(
 async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
     """
     서울시 연도별 미세먼지(PM10) 경보발령 현황을 조회한다. (OA-2228 기반)
-    자치구 구분 없이 서울시 전체 기준 연도별 통계입니다.
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    이 문장에는 출처·기준일자(조회된 연도 범위 + 포털 등록 갱신일)·원문 링크가 이미 모두 포함되어 있다.
-    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
-    [데이터셋 상태] 확인일: 2026-08-02 / 검증 결과: 검증 필요
-    2007~2025년 전 구간 발령횟수/발령일수/최댓농도값이 0으로 조회됨.
-    데이터갱신일자는 최근(2025.11.04)이나 실제 값이 비어있어 원본 확인이 필요한 상태.
+    [데이터셋 상태] 확인일: 2026-08-02 / 2007~2025년 전 구간 값이 0으로 조회되어 원본 확인 필요.
 
     Args:
-        year: 조회할 연도 (예: "2024"). 비워두면 전체 연도 반환.
+        year: 조회할 연도 (예: "2024"). 비워두면 전체 연도.
         start: 조회 시작 인덱스 (기본 1)
-        end: 조회 종료 인덱스 (기본 30, 전체 연도 수)
+        end: 조회 종료 인덱스 (기본 30)
     """
     _check_key()
-    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/YearlyPM10Issue/{start}/{end}/"
+    url = f"{BASE_URL}/{_get_api_key()}/json/YearlyPM10Issue/{start}/{end}/"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -1274,7 +965,6 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
         data = resp.json()
 
     rows = data.get("YearlyPM10Issue", {}).get("row", [])
-
     if year:
         rows = [r for r in rows if r.get("YR", "") == year]
 
@@ -1303,31 +993,17 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
 @mcp.tool()
 async def get_station_height_info(station_name: str = "", start: int = 1, end: int = 40) -> dict:
     """
-    서울시 대기오염물질 측정소별 채취구 높이 정보를 조회한다. (OA-12855 기반, 서비스명: airHgt)
-    ※ 이 데이터셋은 대기질 수치(농도) 자체가 아니라, 각 측정소의 채취구가 지상에서
-    얼마나 높은 곳에 설치되어 있는지를 알려주는 참고 정보이다. 측정값을 해석할 때
-    "이 수치가 지표면 근처 공기인지, 높은 곳 공기인지"를 감안하는 용도로 쓴다.
+    서울시 대기오염물질 측정소별 채취구 높이 정보를 조회한다. (OA-12855 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    ※ 이 데이터셋은 API 응답에 측정일시/갱신일자 필드가 없는 정적 참고정보이므로,
-    "_citation_required" 문장에는 실제 날짜 대신 "이 데이터셋에는 자동 갱신일자가 없다"는
-    사실과 원문 링크가 담겨 있다. 이 경우에도 문장을 임의로 바꾸거나 날짜를 지어내지 말고,
-    주어진 문장을 그대로 출력할 것.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        SEQ: 순서
-        MSRSTN_NM: 측정소명
-        ROAD_NM_ADDR: 도로명주소
-        MSRSTN_HGT: 채취구 높이 (m)
-        SE: 구분
 
     Args:
-        station_name: 측정소명 (예: "종로구"). 비워두면 전체 측정소.
+        station_name: 측정소명 (예: "종로구"). 비워두면 전체.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 40)
     """
     _check_key()
-    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airHgt/{start}/{end}/"
+    url = f"{BASE_URL}/{_get_api_key()}/json/airHgt/{start}/{end}/"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -1335,7 +1011,6 @@ async def get_station_height_info(station_name: str = "", start: int = 1, end: i
         data = resp.json()
 
     rows = data.get("airHgt", {}).get("row", [])
-
     if station_name:
         rows = [r for r in rows if station_name in r.get("MSRSTN_NM", "")]
 
@@ -1351,46 +1026,20 @@ async def get_station_height_info(station_name: str = "", start: int = 1, end: i
 @mcp.tool()
 async def get_air_pollution_item_info(item_code: str = "", start: int = 1, end: int = 10) -> dict:
     """
-    서울시 대기오염 측정항목 코드 정의표를 조회한다. (OA-15515 기반, 서비스명: airPolutionMeasuringItem)
-
-    ⚠️ 중요: 이 도구는 대기질 실측값(농도)이 아니라, 각 측정항목(PM10, O3, NO2 등)의
-    코드·단위·소수점자리수·경보색상별 기준치(파랑/녹색/노랑/주황/빨강)를 알려주는
-    "코드 정의표"다. "지금 대기질이 어떤가"를 묻는 질문에는 이 도구가 아니라
-    get_realtime_air_quality 등 실측값 도구를 사용해야 한다. 이 도구는 그 실측값을
-    해석·검증할 때(예: 단위 확인, 공식 경보기준치와 대조)만 사용한다.
-
-    ⚠️ 제공기관 주의: 이 도구는 지금까지의 다른 도구들(서울특별시 기후환경본부 대기정책과 제공)과
-    달리 서울특별시 보건환경연구원 대기질통합분석센터가 제공하는 데이터셋이다. 답변에서
-    출처를 밝힐 때 이 차이를 명확히 표기할 것.
+    서울시 대기오염 측정항목 코드 정의표를 조회한다. (OA-15515 기반, 보건환경연구원 제공)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    ※ 이 데이터셋은 코드 정의표이므로 "_citation_required" 문장에는 실제 관측일자 대신
-    "실시간 측정값이 아닌 코드 정의표"라는 사실과 제공기관·원문 링크가 담겨 있다.
-    문장을 임의로 바꾸거나 날짜를 지어내지 말고 주어진 문장을 그대로 출력할 것.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        ITEM_CD: 측정항목 코드
-        ITEM_SHRTN_NM: 측정항목명(줄임 명칭, 예: SO2)
-        ITEM_WHOL_NM: 측정항목명(풀 명칭)
-        ITEM_MARK_NM: 측정항목명(첨자부호)
-        SGN_SYMB: 통신기호
-        ITEM_UNIT: 측정단위
-        ITEM_DCPT: 소수점 자리수
-        ITEM_ALRM_BLUE / ITEM_ALRM_GREEN / ITEM_ALRM_YELLOW / ITEM_ALRM_ORANGE / ITEM_ALRM_RED:
-            통합대기환경지수(CAI) 경보색상별 기준치 (파랑/녹색/노랑/주황/빨강)
-        ITEM_SCP_LOWST / ITEM_SCP_HGHST: 측정범위 Low/High
-        ITEM_GROUP: 항목그룹
-        REG_DT: 코드 등록일시 (측정 시각이 아님에 유의)
 
     Args:
-        item_code: 측정항목 코드 (ITEM_CD). 비워두면 전체 항목 반환.
+        item_code: 측정항목 코드 (ITEM_CD). 비워두면 전체.
         start: 조회 시작 인덱스 (기본 1)
-        end: 조회 종료 인덱스 (기본 10, 전체 측정항목 수 기준)
+        end: 조회 종료 인덱스 (기본 10)
     """
     _check_key()
-    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringItem/{start}/{end}/"
     if item_code:
-        url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringItem/{start}/{end}/{item_code}/"
+        url = f"{BASE_URL}/{_get_api_key()}/json/airPolutionMeasuringItem/{start}/{end}/{item_code}/"
+    else:
+        url = f"{BASE_URL}/{_get_api_key()}/json/airPolutionMeasuringItem/{start}/{end}/"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -1398,7 +1047,6 @@ async def get_air_pollution_item_info(item_code: str = "", start: int = 1, end: 
         data = resp.json()
 
     rows = data.get("airPolutionMeasuringItem", {}).get("row", [])
-
     citation = _citation("OA-15515", rows=rows)
     return {
         "count": len(rows),
@@ -1411,42 +1059,21 @@ async def get_air_pollution_item_info(item_code: str = "", start: int = 1, end: 
 @mcp.tool()
 async def get_air_pollution_station_info(station_code: str = "", start: int = 1, end: int = 30) -> dict:
     """
-    서울시 대기오염 측정소 정보(측정소명·주소·공인코드)를 조회한다. (OA-15516 기반, 서비스명: airPolutionMeasuringPlace)
+    서울시 대기오염 측정소 정보(측정소명·주소·공인코드)를 조회한다. (OA-15516 기반, 보건환경연구원 제공)
 
-    ⚠️ 중요: 이 도구는 대기질 실측값(농도)이 아니라, 측정소 자체의 기본 정보(이름·주소·코드)를
-    알려주는 메타정보 도구다. "지금 대기질이 어떤가"를 묻는 질문에는 이 도구가 아니라
-    get_realtime_air_quality 등 실측값 도구를 사용해야 한다. 이 도구는 특정 측정소의 위치·명칭을
-    확인하거나, 실측값 응답의 측정소 코드(MSRSTN_CD)가 어느 측정소인지 대조할 때 사용한다.
-
-    ⚠️ 좌표 없음: 이 데이터셋에는 위도/경도 좌표 필드가 없다. MSRSTN_ADDR(주소, 텍스트)만
-    제공되므로, 지도 표시가 필요하면 이 주소를 별도 지오코딩(예: 카카오맵)해야 한다고
-    안내할 것. 좌표가 있는 것처럼 답하지 말 것.
-
-    ⚠️ 제공기관 주의: 이 도구는 지금까지의 다른 도구들(서울특별시 기후환경본부 대기정책과 제공)과
-    달리 서울특별시 보건환경연구원 대기질통합분석센터가 제공하는 데이터셋이다. 답변에서
-    출처를 밝힐 때 이 차이를 명확히 표기할 것.
-
+    ⚠️ 이 데이터셋에는 위도/경도 좌표 필드가 없다. 지도 표시가 필요하면 주소를 별도 지오코딩해야 한다.
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
-    ※ 이 데이터셋은 측정소 메타정보 정적 참고자료이므로 "_citation_required" 문장에는
-    실제 관측일자 대신 그 사실과 제공기관·원문 링크가 담겨 있다. 문장을 임의로 바꾸거나
-    날짜를 지어내지 말고 주어진 문장을 그대로 출력할 것.
-
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRSTN_CD: 측정소 코드
-        MSRSTN_NM: 측정소 이름
-        MSRSTN_ADDR: 측정소 주소
-        INDCT_SEQ: 표시 순서
-        MSRSTN_OFFICAL_CD: 공인코드
 
     Args:
-        station_code: 측정소 코드 (MSRSTN_CD). 비워두면 전체 측정소.
+        station_code: 측정소 코드 (MSRSTN_CD). 비워두면 전체.
         start: 조회 시작 인덱스 (기본 1)
-        end: 조회 종료 인덱스 (기본 30, 서울시 측정소 수 기준)
+        end: 조회 종료 인덱스 (기본 30)
     """
     _check_key()
-    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringPlace/{start}/{end}/"
     if station_code:
-        url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringPlace/{start}/{end}/{station_code}/"
+        url = f"{BASE_URL}/{_get_api_key()}/json/airPolutionMeasuringPlace/{start}/{end}/{station_code}/"
+    else:
+        url = f"{BASE_URL}/{_get_api_key()}/json/airPolutionMeasuringPlace/{start}/{end}/"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url)
@@ -1454,7 +1081,6 @@ async def get_air_pollution_station_info(station_code: str = "", start: int = 1,
         data = resp.json()
 
     rows = data.get("airPolutionMeasuringPlace", {}).get("row", [])
-
     citation = _citation("OA-15516", rows=rows)
     return {
         "count": len(rows),
@@ -1469,48 +1095,20 @@ async def get_air_pollution_measurement(
     station_code: str = "", item_code: str = "", msrmt_dt: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    서울시 대기오염 측정정보(시간평균 실측값)를 조회한다. (OA-15526 기반, 서비스명: airPolutionMeasuring1Hour)
+    서울시 대기오염 측정정보(시간평균 실측값, 잠정치)를 조회한다. (OA-15526 기반, 보건환경연구원 제공)
 
-    ⚠️ 잠정치 주의: 이 데이터는 각 자치구 측정소에서 측정된 결과를 매시 5분마다 바로 보정해서
-    제공하는 "실시간 잠정치"다. 국가(환경부/에어코리아)의 사후 검증을 거친 확정치가 아니다.
-    공식 통계·연간 보고서에 인용할 때는 이 사실을 반드시 함께 밝히고, 확정치가 필요한 경우
-    별도로 확인이 필요하다는 점을 안내할 것.
-
-    ⚠️ 항목코드 해석 필요: 이 도구가 반환하는 ITEM_CD(측정항목 코드)는 숫자 코드일 뿐이다.
-    어떤 오염물질인지(PM10/PM2.5/O3 등) 알려면 get_air_pollution_item_info 도구로 코드를
-    대조해야 한다. 임의로 짐작해서 이름을 붙이지 말 것.
-
-    ⚠️ 측정소코드 해석 필요: MSRSTN_CD(측정소 코드)가 어느 측정소인지 알려면
-    get_air_pollution_station_info 도구로 대조해야 한다.
-
-    ⚠️ 측정기상태(MSRMT_STTS) 해석: 0=정상, 1=교정, 2=비정상, 4=전원단절, 8=보수중, 9=자료이상.
-    0(정상)이 아닌 값이 섞여 있으면 그 시각의 측정값을 신뢰하기 어렵다는 뜻이므로, 반드시 이
-    상태값을 함께 확인하고 필요하면 답변에 "측정기 상태가 정상이 아니었다"는 점을 명시할 것.
-
-    ⚠️ 제공기관 주의: 이 도구는 대기정책과가 아니라 서울특별시 보건환경연구원 대기질통합분석센터가
-    제공하는 데이터셋이다. 출처를 밝힐 때 이 차이를 명확히 표기할 것.
-
+    ⚠️ 잠정치: 국가(환경부/에어코리아)의 사후 검증을 거친 확정치가 아니다.
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
 
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_DT: 측정일시 (YYYYMMDDHHMMSS)
-        MSRSTN_CD: 측정소 코드 (get_air_pollution_station_info로 대조)
-        ITEM_CD: 측정항목 코드 (get_air_pollution_item_info로 대조)
-        AVG_VL: 평균값
-        MSRMT_STTS: 측정기 상태 (0정상/1교정/2비정상/4전원단절/8보수중/9자료이상)
-        MSRMT_NTN_SE: 국가기준초과구분
-        MSRMT_LCLGV_SE: 지자체기준초과구분
-        STRG_DT: 저장일시
-
     Args:
-        station_code: 측정소 코드 (MSRSTN_CD). 비워두면 전체 측정소.
-        item_code: 측정항목 코드 (ITEM_CD). 비워두면 전체 항목.
-        msrmt_dt: 측정일시 (예: "202608022100"). 비워두면 API가 기본으로 주는 최근 값을 반환.
+        station_code: 측정소 코드 (MSRSTN_CD).
+        item_code: 측정항목 코드 (ITEM_CD).
+        msrmt_dt: 측정일시 (예: "202608022100").
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "airPolutionMeasuring1Hour", str(start), str(end)]
+    parts = [BASE_URL, _get_api_key(), "json", "airPolutionMeasuring1Hour", str(start), str(end)]
     if msrmt_dt:
         parts.append(msrmt_dt)
     url = "/".join(parts) + "/"
@@ -1521,7 +1119,6 @@ async def get_air_pollution_measurement(
         data = resp.json()
 
     rows = data.get("airPolutionMeasuring1Hour", {}).get("row", [])
-
     if station_code:
         rows = [r for r in rows if str(r.get("MSRSTN_CD", "")) == str(station_code)]
     if item_code:
@@ -1542,41 +1139,19 @@ async def get_chimney_emission_measurement(
     facility_name: str = "", pollutant: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    서울시 4개 자원회수시설(소각장) 굴뚝의 대기오염물질 자동측정값을 조회한다. (OA-1256 기반, 서비스명: CleanSYSService)
+    서울시 4개 자원회수시설(소각장) 굴뚝의 대기오염물질 자동측정값을 조회한다. (OA-1256 기반)
 
-    이 도구는 시민이 숨 쉬는 주변 대기질이 아니라, 오염물질을 배출하는 시설(소각장) 자체의
-    배출량을 24시간 자동측정기로 감시하는 데이터다. 배출원 감시·단속 업무에 사용한다.
-
-    ⚠️ 배출허용기준(법적 한도) 없음: 이 데이터셋은 실측값(MSRMT_VL)만 제공하며, 대기환경보전법
-    등에 정해진 배출허용기준 수치는 포함하지 않는다. "기준을 초과했는지" 여부는 이 실측값만으로
-    단정하거나 추측해서 답하지 말 것. 초과 여부 판단이 필요하면 별도로 관련 법령·고시의 배출허용
-    기준을 확인해야 한다고 안내할 것.
-
-    ⚠️ 대상 시설 고정: 강남·노원·마포·양천 4개 자원회수시설(소각장)로 한정되어 있다.
-    facility_name에는 "강남"/"노원"/"마포"/"양천"처럼 짧은 지역명만 넣는다("OO자원회수시설"이
-    아님). 응답의 FCLT_NM 필드에 전체 명칭이 담겨 있다.
-
-    ⚠️ 제공기관 주의: 이 도구는 대기정책과·보건환경연구원과 달리 서울특별시 기후환경본부
-    자원회수시설추진단 자원회수시설과가 제공하는 데이터셋이다. 출처 표기 시 이 차이를 명확히 할 것.
-
+    ⚠️ 배출허용기준(법적 한도) 없음 — 초과 여부는 이 실측값만으로 단정하지 말 것.
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
 
-    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
-        MSRMT_DT: 측정일시
-        FCLT_NM: 시설명 (예: 강남자원회수시설)
-        STACK_NM: 굴뚝명 (예: 1호기(1번굴뚝))
-        ARTCL: 측정항목 (예: 먼지, 질소산화물 등 — 코드가 아닌 한글 항목명)
-        MSRMT_VL: 측정값
-
     Args:
-        facility_name: 시설명 (예: "강남", "노원", "마포", "양천"). 비워두면 원본 API 특성상
-            응답이 비거나 제한될 수 있으니, 가능하면 지정해서 호출할 것.
-        pollutant: 측정항목명 (예: "먼지"). 비워두면 해당 시설의 전체 항목.
+        facility_name: 시설명 (예: "강남", "노원", "마포", "양천").
+        pollutant: 측정항목명 (예: "먼지").
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 100)
     """
     _check_key()
-    parts = [BASE_URL, SEOUL_API_KEY, "json", "CleanSYSService", str(start), str(end)]
+    parts = [BASE_URL, _get_api_key(), "json", "CleanSYSService", str(start), str(end)]
     if facility_name:
         parts.append(facility_name)
         if pollutant:
@@ -1589,7 +1164,6 @@ async def get_chimney_emission_measurement(
         data = resp.json()
 
     rows = data.get("CleanSYSService", {}).get("row", [])
-
     citation = _citation("OA-1256", rows=rows)
     return {
         "count": len(rows),
@@ -1599,6 +1173,15 @@ async def get_chimney_emission_measurement(
     }
 
 
+# ─────────────────────────────────────────────────────────────
+# 서버 실행
+# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # FastMCP ASGI 앱 생성 (stateless_http=True: 각 요청을 독립적으로 처리)
+    fastmcp_app = mcp.http_app(transport="streamable-http", stateless_http=True)
+
+    # URL /{api_key}/mcp 패턴을 처리하는 미들웨어로 감싸기
+    app = APIKeyExtractorMiddleware(fastmcp_app)
+
     port = int(os.environ.get("PORT", 8080))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)
