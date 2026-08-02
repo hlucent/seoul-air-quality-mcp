@@ -160,3 +160,5 @@ fly deploy
 ## 배포 검증 이력
 
 - 2026-08-02: `main.py`에서 3번째 도구(`get_yearly_pm10_alerts`)가 `mcp.run()` 호출 뒤에 정의되어 있어 서버 실행 시 등록되지 않던 버그를 수정(도구 순서 재배치). Fly.io 재배포 후 Claude Desktop 커넥터에서 도구 3개(`get_realtime_air_quality`, `get_hourly_air_quality`, `get_yearly_pm10_alerts`) 전체 정상 인식 및 실제 호출 테스트 완료. `get_yearly_pm10_alerts`의 `_data_quality_warning` 로직도 의도대로 작동하여 원본 데이터셋(OA-2228) 결측 가능성을 정상적으로 안내함.
+
+- 2026-08-02: `get_realtime_air_quality`, `get_hourly_air_quality`에 환경부 통합대기환경지수(CAI) 기준 등급(`cai_grade`)·행동요령(`cai_guidance`) 자동 계산 로직 추가. 단, `get_hourly_air_quality`는 시간값을 기준으로 근사 계산하며, 공식 24시간 평균 기준 등급과는 다를 수 있음.
