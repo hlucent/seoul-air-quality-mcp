@@ -160,6 +160,25 @@ def _source(dataset_id: str) -> dict:
     return _citation(dataset_id)
 
 
+# 농도값(PM10/PM2.5/오존 등)을 반환하는 도구들에 공통으로 붙는 경고문구.
+# 측정소 채취구 높이가 지상보다 높은 경우, 실제 보행자가 지표면 근처에서 체감하는
+# 농도와 차이가 날 수 있다는 대표성 한계를 항상 명시한다.
+# (공무원 보고서 작성 시 "이 수치를 그대로 인용해도 되는지"를 즉시 판단할 수 있도록,
+#  선택 정보가 아니라 응답에 항상 포함되는 기본 정보로 취급한다.)
+_HEIGHT_CAVEAT = (
+    "⚠️ 대표성 참고: 이 수치는 측정소의 채취구 높이에서 측정된 값이며, "
+    "실제 보행자가 지표면 근처에서 체감하는 농도와 다를 수 있습니다(특히 미세먼지는 "
+    "지표면에 가까울수록 농도가 높은 경향). 특정 측정소의 정확한 채취구 높이는 "
+    "get_station_height_info 도구로 확인할 수 있습니다."
+)
+
+
+def _with_height_caveat(result: dict) -> dict:
+    """농도값 반환 도구의 응답에 채취구 높이 대표성 경고문구를 항상 붙인다. 생략 금지."""
+    result["_measurement_representativeness"] = _HEIGHT_CAVEAT
+    return result
+
+
 # 통합대기환경지수(CAI) 산정 기준 (환경부 공식 등급기준)
 # 형식: (구간최솟값, 구간최댓값, 지수최솟값, 지수최댓값)
 _CAI_BREAKPOINTS = {
@@ -248,6 +267,10 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
     요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
 
+    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
+    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
+    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
+
     각 자치구 데이터에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
     cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
     cai_guidance(야외활동 행동요령)가 함께 담겨 있어, 단순히 원시 수치를 해석하지 않아도
@@ -274,12 +297,12 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     rows = [_add_air_quality_grade(r) for r in rows]
 
     citation = _citation("OA-1200", rows=rows)
-    return {
+    return _with_height_caveat({
         "count": len(rows),
         "data": rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
-    }
+    })
 
 
 @mcp.tool()
@@ -292,6 +315,10 @@ async def get_hourly_air_quality(
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
     이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
     요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
+
+    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
+    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
+    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         MSRMT_DT: 측정일시 (YYYYMMDDHH)
@@ -331,12 +358,12 @@ async def get_hourly_air_quality(
     rows = data.get("TimeAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
     citation = _citation("OA-2275", rows=rows)
-    return {
+    return _with_height_caveat({
         "count": len(rows),
         "data": rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
-    }
+    })
 
 
 @mcp.tool()
@@ -351,6 +378,10 @@ async def get_roadside_air_quality(
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
     이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
     요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
+
+    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
+    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
+    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
 
     응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
         MSRMT_DT: 측정일시
@@ -390,12 +421,12 @@ async def get_roadside_air_quality(
     rows = data.get("RealtimeRoadsideStation", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
     citation = _citation("OA-2223", rows=rows)
-    return {
+    return _with_height_caveat({
         "count": len(rows),
         "data": rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
-    }
+    })
 
 
 @mcp.tool()
@@ -410,6 +441,10 @@ async def get_zonal_hourly_air_quality(
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
     이 문장에는 출처·기준일자(데이터의 실제 측정 시각)·원문 링크가 이미 모두 포함되어 있다.
     요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
+
+    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
+    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
+    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
 
     ⚠️ 시간(hour) 표기가 get_hourly_air_quality(00~23)와 다르다. 이 API는 01~24이며,
     24는 해당 날짜의 마지막 시간(자정)을 의미한다. 헷갈리지 않도록 주의할 것.
@@ -470,12 +505,12 @@ async def get_zonal_hourly_air_quality(
         graded_rows.append(r_for_grade)
 
     citation = _citation("OA-2221", rows=rows)
-    return {
+    return _with_height_caveat({
         "count": len(graded_rows),
         "data": graded_rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
-    }
+    })
 
 
 @mcp.tool()
