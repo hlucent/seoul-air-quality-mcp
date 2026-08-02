@@ -204,6 +204,7 @@ https://seoul-air-quality-mcp.fly.dev/mcp?key=여기에본인API키붙여넣기
 https://seoul-air-quality-mcp.fly.dev/mcp?key=abc1234567890xyz
 ```
 ---
+
 방법 1 — Claude.ai 웹/앱에서 연결 (가장 간단)
 claude.ai 접속 후 로그인
 왼쪽 하단 프로필 아이콘 → Settings(설정) 클릭
@@ -214,6 +215,7 @@ Add custom connector 버튼 클릭
 이름	`서울시 대기환경정보 MCP`
 원격 MCP 서버 URL	`https://seoul-air-quality-mcp.fly.dev/mcp?key=본인API키`
 Save 클릭 → 대화창에서 바로 사용 가능
+
 ---
 방법 2 — Claude Desktop 앱에서 연결
 설정 파일(`claude_desktop_config.json`)을 열어 아래 내용을 추가합니다.
