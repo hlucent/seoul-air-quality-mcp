@@ -1,4 +1,4 @@
-# 서울시 대기환경 정보 MCP (seoul-air-quality-mcp)
+# 서울시 대기환경정보 MCP (seoul-air-quality-mcp)
 
 서울특별시 기후환경본부 대기정책과에서 관리하는 대기환경 공공데이터를
 AI(Claude 등)가 직접 조회할 수 있도록 만든 MCP(Model Context Protocol) 서버입니다.
