@@ -158,6 +158,24 @@ _DATASET_INFO = {
             "LAST_MDFCN_YMD(최종수정일자)·DATA_UPDT_YMD(데이터갱신일자)를 확인해야 합니다."
         ),
     },
+    "OA-15515": {
+        "dataset_name": "서울시 대기오염 측정항목 정보",
+        "dataset_id": "OA-15515",
+        # 지금까지의 도구와 제공기관이 다르다: 대기정책과가 아니라 보건환경연구원
+        # 대기질통합분석센터가 제공하는 첫 데이터셋이다. 실측값을 다루는 다른 도구들과
+        # 절대 혼동되지 않도록 도구 설명·응답에서 항상 명확히 구분해서 표기한다.
+        "provider": "서울특별시 보건환경연구원 대기질통합분석센터",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-15515/S/1/datasetView.do",
+        # 이 데이터셋은 실시간 측정값이 아니라 측정항목 코드 정의표(단위, 소수점자리수,
+        # 경보색상별 기준치 등)다. 행별 REG_DT(등록일시)는 있지만 "관측 시각"이 아니라
+        # "코드 등록 시각"이므로, 기준일자를 실측 데이터처럼 계산하지 않는다.
+        "static_reference_note": (
+            "이 데이터셋은 실시간 측정값이 아닌 측정항목 코드 정의표(단위·소수점자리수·"
+            "경보색상별 기준치 등)이며, 다른 도구들과 제공기관도 다릅니다(보건환경연구원 "
+            "대기질통합분석센터). 실제 측정값을 조회하려면 대기정책과 제공 도구를 사용하고, "
+            "이 도구는 그 수치를 해석하기 위한 참고 정보로만 사용하세요."
+        ),
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -1288,6 +1306,66 @@ async def get_station_height_info(station_name: str = "", start: int = 1, end: i
         rows = [r for r in rows if station_name in r.get("MSRSTN_NM", "")]
 
     citation = _citation("OA-12855", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_air_pollution_item_info(item_code: str = "", start: int = 1, end: int = 10) -> dict:
+    """
+    서울시 대기오염 측정항목 코드 정의표를 조회한다. (OA-15515 기반, 서비스명: airPolutionMeasuringItem)
+
+    ⚠️ 중요: 이 도구는 대기질 실측값(농도)이 아니라, 각 측정항목(PM10, O3, NO2 등)의
+    코드·단위·소수점자리수·경보색상별 기준치(파랑/녹색/노랑/주황/빨강)를 알려주는
+    "코드 정의표"다. "지금 대기질이 어떤가"를 묻는 질문에는 이 도구가 아니라
+    get_realtime_air_quality 등 실측값 도구를 사용해야 한다. 이 도구는 그 실측값을
+    해석·검증할 때(예: 단위 확인, 공식 경보기준치와 대조)만 사용한다.
+
+    ⚠️ 제공기관 주의: 이 도구는 지금까지의 다른 도구들(서울특별시 기후환경본부 대기정책과 제공)과
+    달리 서울특별시 보건환경연구원 대기질통합분석센터가 제공하는 데이터셋이다. 답변에서
+    출처를 밝힐 때 이 차이를 명확히 표기할 것.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    ※ 이 데이터셋은 코드 정의표이므로 "_citation_required" 문장에는 실제 관측일자 대신
+    "실시간 측정값이 아닌 코드 정의표"라는 사실과 제공기관·원문 링크가 담겨 있다.
+    문장을 임의로 바꾸거나 날짜를 지어내지 말고 주어진 문장을 그대로 출력할 것.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        ITEM_CD: 측정항목 코드
+        ITEM_SHRTN_NM: 측정항목명(줄임 명칭, 예: SO2)
+        ITEM_WHOL_NM: 측정항목명(풀 명칭)
+        ITEM_MARK_NM: 측정항목명(첨자부호)
+        SGN_SYMB: 통신기호
+        ITEM_UNIT: 측정단위
+        ITEM_DCPT: 소수점 자리수
+        ITEM_ALRM_BLUE / ITEM_ALRM_GREEN / ITEM_ALRM_YELLOW / ITEM_ALRM_ORANGE / ITEM_ALRM_RED:
+            통합대기환경지수(CAI) 경보색상별 기준치 (파랑/녹색/노랑/주황/빨강)
+        ITEM_SCP_LOWST / ITEM_SCP_HGHST: 측정범위 Low/High
+        ITEM_GROUP: 항목그룹
+        REG_DT: 코드 등록일시 (측정 시각이 아님에 유의)
+
+    Args:
+        item_code: 측정항목 코드 (ITEM_CD). 비워두면 전체 항목 반환.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 10, 전체 측정항목 수 기준)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringItem/{start}/{end}/"
+    if item_code:
+        url = f"{BASE_URL}/{SEOUL_API_KEY}/json/airPolutionMeasuringItem/{start}/{end}/{item_code}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("airPolutionMeasuringItem", {}).get("row", [])
+
+    citation = _citation("OA-15515", rows=rows)
     return {
         "count": len(rows),
         "data": rows,
