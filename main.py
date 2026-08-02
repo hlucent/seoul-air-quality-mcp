@@ -1,4 +1,4 @@
-"""
+﻿"""
 서울시 대기환경 정보 MCP 서버
 - 원본 데이터: 서울 열린데이터광장 (data.seoul.go.kr)
 - 담당부서: 서울특별시 기후환경본부 대기정책과
@@ -45,7 +45,7 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     rows = data.get("RealtimeCityAir", {}).get("row", [])
 
     if district:
-        rows = [r for r in rows if district in r.get("MSRSTE_NM", "")]
+        rows = [r for r in rows if district in r.get("MSRSTN_NM", "")]
 
     return {
         "count": len(rows),
