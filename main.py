@@ -24,6 +24,48 @@ def _check_key():
         )
 
 
+# 각 도구가 사용하는 원본 데이터셋 정보 (공무원 보고서 작성 시 출처 확인용)
+# 응답에 "_data_source" 필드로 함께 반환되어, 이 수치가 어느 데이터셋에서 나왔는지
+# 언제나 명확히 추적할 수 있도록 한다.
+_DATASET_INFO = {
+    "OA-1200": {
+        "dataset_name": "서울시 실시간 자치구별 대기환경 현황",
+        "dataset_id": "OA-1200",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-1200/S/1/datasetView.do",
+    },
+    "OA-2275": {
+        "dataset_name": "서울시 시간 평균 대기오염도 정보",
+        "dataset_id": "OA-2275",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-2275/S/1/datasetView.do",
+    },
+    "OA-2223": {
+        "dataset_name": "서울시 도로변/입체대기 측정소별 실시간 대기환경 현황",
+        "dataset_id": "OA-2223",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-2223/S/1/datasetView.do",
+    },
+    "OA-2221": {
+        "dataset_name": "서울시 기간별 시간평균 대기환경 정보",
+        "dataset_id": "OA-2221",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-2221/S/1/datasetView.do",
+    },
+    "OA-2228": {
+        "dataset_name": "서울시 연도별 미세먼지(PM10) 경보발령 현황",
+        "dataset_id": "OA-2228",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-2228/S/1/datasetView.do",
+    },
+}
+
+
+def _source(dataset_id: str) -> dict:
+    """dataset_id(OA번호)에 해당하는 출처 정보를 반환한다. 모든 도구 응답에 _data_source로 포함시킬 것."""
+    return _DATASET_INFO.get(dataset_id, {"dataset_id": dataset_id, "note": "출처 정보 미등록"})
+
+
 # 통합대기환경지수(CAI) 산정 기준 (환경부 공식 등급기준)
 # 형식: (구간최솟값, 구간최댓값, 지수최솟값, 지수최댓값)
 _CAI_BREAKPOINTS = {
@@ -136,6 +178,7 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
     return {
         "count": len(rows),
         "data": rows,
+        "_data_source": _source("OA-1200"),
     }
 
 
@@ -183,7 +226,7 @@ async def get_hourly_air_quality(
 
     rows = data.get("TimeAverageAirQuality", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-    return {"count": len(rows), "data": rows}
+    return {"count": len(rows), "data": rows, "_data_source": _source("OA-2275")}
 
 
 @mcp.tool()
@@ -232,7 +275,7 @@ async def get_roadside_air_quality(
 
     rows = data.get("RealtimeRoadsideStation", {}).get("row", [])
     rows = [_add_air_quality_grade(r) for r in rows]
-    return {"count": len(rows), "data": rows}
+    return {"count": len(rows), "data": rows, "_data_source": _source("OA-2223")}
 
 
 @mcp.tool()
@@ -302,7 +345,7 @@ async def get_zonal_hourly_air_quality(
         r_for_grade.pop("PM", None)  # 원본 응답에 없던 임시 필드는 제거
         graded_rows.append(r_for_grade)
 
-    return {"count": len(graded_rows), "data": graded_rows}
+    return {"count": len(graded_rows), "data": graded_rows, "_data_source": _source("OA-2221")}
 
 
 @mcp.tool()
@@ -346,6 +389,7 @@ async def get_yearly_pm10_alerts(year: str = "", start: int = 1, end: int = 30) 
     result = {
         "count": len(rows),
         "data": rows,
+        "_data_source": _source("OA-2228"),
     }
     if warning:
         result["_data_quality_warning"] = warning
