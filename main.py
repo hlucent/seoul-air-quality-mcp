@@ -88,10 +88,16 @@ _DATASET_INFO = {
             "원문 링크의 실시간 화면에서 직접 확인해야 합니다."
         ),
     },
+    "OA-2220": {
+        "dataset_name": "서울시 기간별 일평균 대기환경 정보",
+        "dataset_id": "OA-2220",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-2220/S/1/datasetView.do",
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
-_DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE"]
+_DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE", "MSRMT_YMD"]
 
 
 def _format_msrdt(raw: str) -> str:
@@ -682,6 +688,82 @@ async def get_zonal_hourly_air_quality(
     return _with_height_caveat({
         "count": len(graded_rows),
         "data": graded_rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    })
+
+
+@mcp.tool()
+async def get_zonal_daily_air_quality(
+    date: str, sarea: str = "", station_name: str = "", start: int = 1, end: int = 100
+) -> dict:
+    """
+    특정 날짜의 권역별/측정소별 일평균 대기환경 정보를 조회한다. (OA-2220 기반, 서비스명: DailyAverageCityAir)
+    ※ get_zonal_hourly_air_quality(OA-2221, 시간평균)의 "하루 단위" 버전이다. 시간별 변화가
+    아니라 그 날 하루 전체의 평균값이 필요할 때 이 도구를 사용할 것.
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    이 문장에는 출처·기준일자(조회한 날짜)·원문 링크가 이미 모두 포함되어 있다.
+    요약하거나 일부만 옮기지 말고 문장 전체를 그대로 쓸 것.
+
+    ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
+    측정소 채취구 높이 때문에 이 수치가 보행자 실제 체감농도와 다를 수 있다는 대표성 한계이며,
+    보고서 작성자가 이 데이터를 그대로 인용해도 될지 판단하는 데 필요한 기본 정보다.
+
+    ⚠️ 필수(생략 불가): 각 행에 포함된 station_intake_height_m(채취구 높이, m)과
+    station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라. "높다/낮다" 같은
+    정성적 표현으로 뭉뚱그리지 말고, 실제 수치(예: "19.3m")와 주소를 그대로 옮길 것. 매칭되는
+    높이정보가 없는 측정소는 station_intake_height_m이 null이며, 이 경우에도 "높이정보 없음"이라고
+    명시해야 한다(조용히 생략 금지).
+
+    자치구 단위가 아니라 권역(SAREA_NM, 예: 도심권/서북권/동북권/서남권/동남권) 단위로 묶여서 나온다.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인):
+        MSRMT_YMD: 측정일자 (YYYYMMDD)
+        SAREA_NM: 권역명
+        MSRSTN_NM: 측정소명
+        PM: 미세먼지 일평균 (μg/m³)
+        FPM: 초미세먼지 일평균 (μg/m³)
+        OZON: 오존 일평균 (ppm)
+        NTDX: 이산화질소 일평균 (ppm)
+        CBMX: 일산화탄소 일평균 (ppm)
+        SPDX: 아황산가스 일평균 (ppm)
+
+    각 행에는 환경부 통합대기환경지수(CAI) 기준으로 직접 계산한
+    cai_index(지수), cai_grade(좋음/보통/나쁨/매우나쁨), cai_determining_pollutant(지배오염물질),
+    cai_guidance(야외활동 행동요령)가 함께 담겨 있다.
+
+    Args:
+        date: 조회할 날짜, YYYYMMDD 형식 (예: "20260801")
+        sarea: 권역명 (예: "도심권", "서북권", "동북권", "서남권", "동남권"). 비워두면 전체 권역.
+        station_name: 측정소명 (예: "강남구"). 비워두면 전체 측정소.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+
+    parts = [BASE_URL, SEOUL_API_KEY, "json", "DailyAverageCityAir", str(start), str(end), date]
+    if sarea:
+        parts.append(sarea)
+    if station_name:
+        parts.append(station_name)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("DailyAverageCityAir", {}).get("row", [])
+    rows = [_add_air_quality_grade(r) for r in rows]
+
+    heights = await _get_station_heights()
+    rows = _attach_station_info(rows, heights)
+
+    citation = _citation("OA-2220", rows=rows)
+    return _with_height_caveat({
+        "count": len(rows),
+        "data": rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
     })
