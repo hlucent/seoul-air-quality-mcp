@@ -156,3 +156,7 @@ fly deploy
   2. 위 표에서 "폐기 (마지막 갱신: YYYY.MM)"로 표시 후 일정 기간 뒤 표에서도 삭제
   3. 유사한 신규 데이터셋이 있는지 확인하여 대체
 - 정기 점검: 매년 초 전체 데이터셋의 갱신일자를 재확인
+
+## 배포 검증 이력
+
+- 2026-08-02: `main.py`에서 3번째 도구(`get_yearly_pm10_alerts`)가 `mcp.run()` 호출 뒤에 정의되어 있어 서버 실행 시 등록되지 않던 버그를 수정(도구 순서 재배치). Fly.io 재배포 후 Claude Desktop 커넥터에서 도구 3개(`get_realtime_air_quality`, `get_hourly_air_quality`, `get_yearly_pm10_alerts`) 전체 정상 인식 및 실제 호출 테스트 완료. `get_yearly_pm10_alerts`의 `_data_quality_warning` 로직도 의도대로 작동하여 원본 데이터셋(OA-2228) 결측 가능성을 정상적으로 안내함.
