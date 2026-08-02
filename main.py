@@ -145,6 +145,19 @@ _DATASET_INFO = {
             "직접 확인해야 합니다."
         ),
     },
+    "OA-16122": {
+        "dataset_name": "서울시 대기오염물질배출시설설치사업장 인허가 정보",
+        "dataset_id": "OA-16122",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-16122/S/1/datasetView.do",
+        # 대기질 측정값이 아니라 인허가/영업상태 스냅샷이다. 포털 설명상 "3일전 자료"를
+        # 제공하므로, 정확한 기준일자는 행별 LAST_MDFCN_YMD(최종수정일자)를 참고해야 한다.
+        "static_reference_note": (
+            "이 데이터셋은 대기질 수치가 아니라 사업장 인허가/영업상태 스냅샷이며, "
+            "포털 설명에 따르면 3일 전 자료 기준으로 제공됩니다. 정확한 기준일자는 각 행의 "
+            "LAST_MDFCN_YMD(최종수정일자)·DATA_UPDT_YMD(데이터갱신일자)를 확인해야 합니다."
+        ),
+    },
 }
 
 # 측정일시로 흔히 쓰이는 필드명 후보 (데이터셋마다 이름이 조금씩 다르다)
@@ -1095,6 +1108,89 @@ async def get_air_pollution_board_locations(
         "data": rows,
         "_data_source": citation,
         "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_air_pollutant_emission_facilities(
+    district: str = "", business_name: str = "", status: str = "", start: int = 1, end: int = 100
+) -> dict:
+    """
+    서울시 대기오염물질배출시설설치사업장의 인허가·영업상태 정보를 조회한다.
+    (OA-16122 기반, 서비스명: LOCALDATA_093008, 행정안전부 지방행정인허가데이터 표준 서식)
+
+    ※ 이 도구는 대기질 "수치"가 아니라, 대기오염물질을 배출하는 "사업장" 자체의 인허가·영업
+    현황을 알려준다. 활용 예: 특정 지역의 대기질이 나쁠 때, 그 지역에 어떤 배출사업장이
+    있는지 찾아 현장 점검 대상 후보를 추리는 용도.
+
+    ⚠️ 필수(생략 불가) — 좌표계 경고: XCRD/YCRD는 위도·경도가 아니라 중부원점TM(EPSG:5174)
+    좌표계의 평면좌표다. 지도 서비스(구글맵 등)에 위도/경도인 것처럼 그대로 입력하면 완전히
+    엉뚱한 위치가 표시된다. 지도에 표시하려면 반드시 좌표변환(EPSG:5174 → WGS84)을 거쳐야
+    한다는 사실을 답변에 명시할 것. 주소(LOTNO_ADDR 지번주소, ROAD_NM_ADDR 도로명주소)는
+    변환 없이 바로 사용 가능하다.
+
+    ⚠️ 이 API는 자치구·상태로 서버에서 걸러주는 파라미터가 없다(요청인자에 KEY/TYPE/SERVICE/
+    START_INDEX/END_INDEX만 있음). 그래서 이 도구는 넉넉히 데이터를 받아온 뒤 Python에서
+    직접 필터링한다 — district/business_name/status로 원하는 결과가 안 보이면, start/end
+    범위를 늘려서 더 많은 사업장을 조회해야 할 수 있다(전체 사업장 수가 많을 수 있음).
+
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+    ※ 이 데이터셋은 대기질 실시간 수치가 아니라 인허가 스냅샷(포털 설명상 3일 전 자료)이므로,
+    "_citation_required" 문장에는 실제 측정시각 대신 이 사실과 원문 링크가 담겨 있다. 이
+    경우에도 문장을 임의로 바꾸지 말고 그대로 출력할 것. 개별 사업장의 정확한 기준일자가
+    필요하면 그 행의 LAST_MDFCN_YMD(최종수정일자)를 함께 안내할 것.
+
+    응답 필드 의미 (data.seoul.go.kr 예제 기준으로 확인, 주요 필드만):
+        BPLC_NM: 사업장명
+        LOTNO_ADDR / ROAD_NM_ADDR: 지번주소 / 도로명주소
+        SALS_STTS_NM: 영업상태명 (영업/폐업/휴업 등)
+        DTL_SALS_STTS_NM: 상세영업상태명
+        LCPMT_YMD: 인허가일자
+        CLSBIZ_YMD: 폐업일자
+        TELNO: 전화번호
+        CTGRY_NM: 종별명 (배출시설 종류)
+        MAIN_PRDT_NM: 주생산품명
+        XCRD / YCRD: 위치좌표 (TM좌표, 위경도 아님 — 위 경고 참고)
+        LAST_MDFCN_YMD: 최종수정일자
+        DATA_UPDT_YMD: 데이터갱신일자
+
+    Args:
+        district: 주소에 포함될 자치구/지역명으로 필터링 (예: "강남구"). 비워두면 전체.
+        business_name: 사업장명에 포함될 문자열로 필터링 (예: "OO공장"). 비워두면 전체.
+        status: 영업상태명으로 필터링 (예: "영업", "폐업", "휴업"). 비워두면 전체.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100, 한 번에 최대 1000까지 가능)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{SEOUL_API_KEY}/json/LOCALDATA_093008/{start}/{end}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("LOCALDATA_093008", {}).get("row", [])
+
+    if district:
+        rows = [
+            r for r in rows
+            if district in r.get("LOTNO_ADDR", "") or district in r.get("ROAD_NM_ADDR", "")
+        ]
+    if business_name:
+        rows = [r for r in rows if business_name in r.get("BPLC_NM", "")]
+    if status:
+        rows = [r for r in rows if status in r.get("SALS_STTS_NM", "")]
+
+    citation = _citation("OA-16122", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+        "_coordinate_system_warning": (
+            "XCRD/YCRD는 위도·경도가 아니라 중부원점TM(EPSG:5174) 평면좌표입니다. "
+            "지도 서비스에 그대로 입력하면 안 되며, 반드시 WGS84로 좌표변환 후 사용해야 합니다."
+        ),
     }
 
 
