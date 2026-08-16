@@ -108,8 +108,16 @@ python main.py
 
 ```bash
 fly launch --no-deploy
-fly secrets set SEOUL_API_KEY="발급받은_인증키"
+fly secrets set --app seoul-air-quality-mcp SEOUL_API_KEY="발급받은_인증키"
 fly deploy
+```
+
+### Fly.io secrets 등록 (인증키 교체 시)
+
+새 인증키를 발급받아 교체할 때는 아래 명령으로 secret을 갱신한다(재배포 없이도 앱이 재시작되며 반영됨):
+
+```bash
+fly secrets set --app seoul-air-quality-mcp SEOUL_API_KEY="새로_발급받은_인증키"
 ```
 
 ---
@@ -143,7 +151,24 @@ fly deploy
 | 서울시 연도별 미세먼지 경보발령 현황 | OA-2228 | YearlyPM10Issue | 서울시 전체 | `get_yearly_pm10_alerts` | 검증 필요 (2007~2025 전 구간 0으로 조회됨) |
 | (그 외 연관 데이터셋) | - | - | - | - | 예정 |
 
-참고: API 키는 데이터셋마다 따로 발급받지 않고, 서울 열린데이터광장에서 발급받은 인증키 하나(SEOUL_API_KEY)로 모든 Open API를 사용합니다.
+참고: API 키는 데이터셋마다 따로 발급받지 않고, 서울 열린데이터광장에서 발급받은 인증키 하나(SEOUL_API_KEY)로 모든 Open API를 사용합니다. 이 키는 서버 환경변수로만 관리되며 사용자가 직접 다룰 필요가 없습니다.
+
+## 서버 접속 방식 및 남용 방지 (2026-08-16 변경)
+
+기존에는 사용자가 자신의 서울 열린데이터광장 API 키를 URL 쿼리 파라미터(`?key=...`)로 붙여서 접속해야 했고, 이 값이 그대로 서울시 Open API 호출에 사용되는 구조였습니다. 이 방식을 다음과 같이 변경했습니다.
+
+- 서버가 환경변수 `SEOUL_API_KEY` 하나로 서울시 Open API를 호출한다. 사용자는 더 이상 API 키를 URL에 붙일 필요가 없다.
+- `?key=...` 기반의 접속 인증 로직은 제거했다.
+- 대신 IP 기준 in-memory rate limit을 적용해 서버 비용을 보호한다:
+  - 같은 IP가 **분당 3회** 초과 요청 시 `429`
+  - **1시간 내 429를 5회 이상** 받은 IP는 **24시간 차단**
+  - IP당 **일일 총 호출 30회** 초과 시 `429`
+- rate limit 상태는 프로세스 메모리에만 저장되며, 서버 재시작 시 초기화된다. 다중 인스턴스로 스케일할 경우 인스턴스별로 별도 카운트된다는 점에 유의.
+
+연결 URL도 더 이상 `?key=` 없이 사용한다:
+```
+https://seoul-air-quality-mcp.fly.dev/mcp
+```
 
 ## 데이터셋 유지보수 원칙
 
@@ -161,24 +186,20 @@ fly deploy
 
 - 2026-08-02: `get_realtime_air_quality`, `get_hourly_air_quality`에 환경부 통합대기환경지수(CAI) 기준 등급(`cai_grade`)·행동요령(`cai_guidance`) 자동 계산 로직 추가. 단, `get_hourly_air_quality`는 시간값을 기준으로 근사 계산하며, 공식 24시간 평균 기준 등급과는 다를 수 있음.
 
+- 2026-08-16: 사용자별 `?key=` 쿼리 파라미터 인증 방식을 제거하고, 서버가 환경변수 `SEOUL_API_KEY` 하나로 서울시 Open API를 호출하는 방식으로 전환. 대신 IP 기준 in-memory rate limit(분당 3회, 1시간 내 429 5회 이상 시 24시간 차단, 일일 총 30회)을 추가해 서버 비용 남용을 방지. `fly secrets set --app seoul-air-quality-mcp SEOUL_API_KEY=...`로 키 등록/교체.
+
 ---
 
 ## 🔌Claude에 연결하는 방법
-> 설치 없이 **URL 하나만으로** 연결할 수 있습니다. 소요시간 약 3분.
+> 설치 없이 **URL 하나만으로** 연결할 수 있습니다. 소요시간 약 1분.
 ---
-📋 사전 준비 — 서울 열린데이터광장 API 키 발급
-data.seoul.go.kr 접속 → 회원가입 후 로그인
-오른쪽 상단 내 정보 → 인증키 관리 클릭
-발급된 인증키(API Key)를 복사해서 메모장에 저장
-> ✅ 무료입니다. 별도 심사 없이 즉시 발급됩니다.
+API 키는 서버가 환경변수로 관리하므로, 사용자는 별도로 API 키를 발급받거나 URL에 붙일 필요가 없습니다.
+
+다만 남용 방지를 위해 IP 기준 rate limit(분당 3회, 1시간 내 429 5회 이상 시 24시간 차단, 일일 30회)이 적용됩니다.
 ---
-연결 URL 형식
+연결 URL
 ```
-https://seoul-air-quality-mcp.fly.dev/mcp?key=여기에본인API키붙여넣기
-```
-예시:
-```
-https://seoul-air-quality-mcp.fly.dev/mcp?key=abc1234567890xyz
+https://seoul-air-quality-mcp.fly.dev/mcp
 ```
 ---
 
@@ -190,7 +211,7 @@ Add custom connector 버튼 클릭
 아래와 같이 입력:
 항목	입력값
 이름	`서울시 대기환경정보 MCP`
-원격 MCP 서버 URL	`https://seoul-air-quality-mcp.fly.dev/mcp?key=본인API키`
+원격 MCP 서버 URL	`https://seoul-air-quality-mcp.fly.dev/mcp`
 Save 클릭 → 대화창에서 바로 사용 가능
 
 ---
@@ -206,7 +227,7 @@ Save 클릭 → 대화창에서 바로 사용 가능
   "mcpServers": {
     "서울시 대기환경정보 MCP": {
       "type": "http",
-      "url": "https://seoul-air-quality-mcp.fly.dev/mcp?key=본인API키"
+      "url": "https://seoul-air-quality-mcp.fly.dev/mcp"
     }
   }
 }

@@ -3,33 +3,30 @@
 - 원본 데이터: 서울 열린데이터광장 (data.seoul.go.kr)
 - 담당부서: 서울특별시 기후환경본부 대기정책과
 
-인증키 주입 방식:
-  [필수] 쿼리 파라미터 방식 — 키 없이 접속하면 차단됨
-        https://서버주소/mcp?key={서울열린데이터광장API키}
-        예) https://seoul-air-quality-mcp.fly.dev/mcp?key=abc123xyz
+인증키 관리:
+  서버가 환경변수 SEOUL_API_KEY 하나로 서울시 Open API를 호출한다.
+  사용자는 더 이상 자신의 키를 쿼리 파라미터로 넘길 필요가 없다.
+  인증키는 코드에 절대 하드코딩하지 않는다.
 
-인증키는 코드에 절대 하드코딩하지 않는다.
+접속 인증 / 남용 방지:
+  URL 쿼리 파라미터(?key=...) 기반 접속 인증은 제거되었다.
+  대신 IP 기준 in-memory rate limit을 적용한다 (RateLimitMiddleware 참고).
 """
 
-import contextvars
 import os
+import time
+from collections import defaultdict, deque
 
 import httpx
 import uvicorn
 from fastmcp import FastMCP
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-# ─────────────────────────────────────────────────────────────
-# 요청별 API 키 — ?key=... 쿼리 파라미터에서 추출
-# ─────────────────────────────────────────────────────────────
-_request_api_key: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "request_api_key", default=""
-)
+SEOUL_API_KEY = os.environ.get("SEOUL_API_KEY", "")
 
 
 def _get_api_key() -> str:
-    """현재 요청의 ?key= 쿼리 파라미터에서 추출한 API 키를 반환한다."""
-    return _request_api_key.get()
+    return SEOUL_API_KEY
 
 
 BASE_URL = "http://openapi.seoul.go.kr:8088"
@@ -60,68 +57,121 @@ mcp = FastMCP(
 def _check_key():
     if not _get_api_key():
         raise RuntimeError(
-            "API 키가 없습니다. URL에 ?key=본인키 를 붙여서 연결하세요.\n"
-            "연결 URL 형식: https://seoul-air-quality-mcp.fly.dev/mcp?key=본인서울API키\n"
-            "API 키 발급: https://data.seoul.go.kr (회원가입 후 인증키 관리 메뉴)"
+            "서버에 SEOUL_API_KEY 환경변수가 설정되어 있지 않습니다. "
+            "관리자에게 문의하세요."
         )
 
 
 # ─────────────────────────────────────────────────────────────
-# ?key=... 쿼리 파라미터에서 API 키를 추출하는 ASGI 미들웨어
-# 키가 없으면 HTTP 401로 차단 — 서버 비용 보호
+# IP 기준 in-memory rate limit 미들웨어
+#   - 같은 IP가 분당 3회 초과 요청 시 429
+#   - 1시간 내 429를 5회 이상 받은 IP는 24시간 차단
+#   - IP당 일일 총 호출 30회 초과 시 429
 # ─────────────────────────────────────────────────────────────
-class APIKeyExtractorMiddleware:
-    """
-    모든 HTTP 요청의 ?key= 쿼리 파라미터에서 서울 API 키를 추출한다.
-    키가 없으면 HTTP 401 응답을 돌려보내고 서버(FastMCP)로 전달하지 않는다.
+_MINUTE = 60
+_HOUR = 3600
+_DAY = 86400
 
-    연결 URL 예시: https://seoul-air-quality-mcp.fly.dev/mcp?key=abc123xyz
-    """
+_PER_MINUTE_LIMIT = 3
+_VIOLATIONS_BEFORE_BLOCK = 5
+_VIOLATION_WINDOW = _HOUR
+_BLOCK_DURATION = _DAY
+_DAILY_LIMIT = 30
+
+
+class RateLimiter:
+    """단일 프로세스 in-memory 상태. 재시작 시 초기화된다."""
+
+    def __init__(self) -> None:
+        self._request_times: dict[str, deque] = defaultdict(deque)
+        self._daily_times: dict[str, deque] = defaultdict(deque)
+        self._violation_times: dict[str, deque] = defaultdict(deque)
+        self._blocked_until: dict[str, float] = {}
+
+    def check(self, ip: str) -> tuple[bool, str]:
+        """요청을 허용할지 판단한다. (allowed, reason) 반환."""
+        now = time.monotonic()
+
+        blocked_until = self._blocked_until.get(ip)
+        if blocked_until is not None:
+            if now < blocked_until:
+                return False, "blocked"
+            del self._blocked_until[ip]
+
+        minute_q = self._request_times[ip]
+        while minute_q and now - minute_q[0] > _MINUTE:
+            minute_q.popleft()
+
+        daily_q = self._daily_times[ip]
+        while daily_q and now - daily_q[0] > _DAY:
+            daily_q.popleft()
+
+        if len(minute_q) >= _PER_MINUTE_LIMIT or len(daily_q) >= _DAILY_LIMIT:
+            self._record_violation(ip, now)
+            reason = "daily_limit" if len(daily_q) >= _DAILY_LIMIT else "per_minute_limit"
+            return False, reason
+
+        minute_q.append(now)
+        daily_q.append(now)
+        return True, ""
+
+    def _record_violation(self, ip: str, now: float) -> None:
+        violation_q = self._violation_times[ip]
+        violation_q.append(now)
+        while violation_q and now - violation_q[0] > _VIOLATION_WINDOW:
+            violation_q.popleft()
+
+        if len(violation_q) >= _VIOLATIONS_BEFORE_BLOCK:
+            self._blocked_until[ip] = now + _BLOCK_DURATION
+            violation_q.clear()
+
+
+_rate_limiter = RateLimiter()
+
+
+def _client_ip(scope: Scope) -> str:
+    headers = dict(scope.get("headers") or [])
+    forwarded = headers.get(b"x-forwarded-for")
+    if forwarded:
+        return forwarded.decode("utf-8").split(",")[0].strip()
+    client = scope.get("client")
+    return client[0] if client else "unknown"
+
+
+class RateLimitMiddleware:
+    """IP 기준 rate limit을 적용하는 ASGI 미들웨어."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            # 쿼리 파라미터 파싱
-            query_string = scope.get("query_string", b"").decode("utf-8")
-            params: dict[str, str] = {}
-            for part in query_string.split("&"):
-                if "=" in part:
-                    k, v = part.split("=", 1)
-                    params[k.strip()] = v.strip()
-
-            api_key = params.get("key", "").strip()
-
-            if not api_key:
-                # API 키 없음 → 즉시 401 반환, FastMCP에 전달 안 함
-                body = (
-                    "❌ API 키가 필요합니다.\n\n"
-                    "연결 URL 형식:\n"
-                    "  https://seoul-air-quality-mcp.fly.dev/mcp?key=본인서울API키\n\n"
-                    "API 키 발급:\n"
-                    "  https://data.seoul.go.kr → 회원가입 → 인증키 관리\n"
-                ).encode("utf-8")
-                await send({
-                    "type": "http.response.start",
-                    "status": 401,
-                    "headers": [
-                        (b"content-type", b"text/plain; charset=utf-8"),
-                        (b"content-length", str(len(body)).encode()),
-                    ],
-                })
-                await send({"type": "http.response.body", "body": body})
-                return
-
-            # 키를 요청 컨텍스트에 저장 후 FastMCP로 전달
-            token = _request_api_key.set(api_key)
-            try:
-                await self.app(scope, receive, send)
-            finally:
-                _request_api_key.reset(token)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
             return
 
-        # HTTP 외(WebSocket 등)는 그대로 통과
+        ip = _client_ip(scope)
+        allowed, reason = _rate_limiter.check(ip)
+
+        if not allowed:
+            if reason == "blocked":
+                message = "이 IP는 반복적인 요청 제한 위반으로 24시간 차단되었습니다."
+            elif reason == "daily_limit":
+                message = "일일 호출 한도(30회)를 초과했습니다. 내일 다시 시도해주세요."
+            else:
+                message = "요청이 너무 잦습니다. 분당 3회까지 허용됩니다."
+
+            body = message.encode("utf-8")
+            await send({
+                "type": "http.response.start",
+                "status": 429,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+
         await self.app(scope, receive, send)
 
 
@@ -1180,8 +1230,8 @@ if __name__ == "__main__":
     # FastMCP ASGI 앱 생성 (stateless_http=True: 각 요청을 독립적으로 처리)
     fastmcp_app = mcp.http_app(transport="streamable-http", stateless_http=True)
 
-    # URL /{api_key}/mcp 패턴을 처리하는 미들웨어로 감싸기
-    app = APIKeyExtractorMiddleware(fastmcp_app)
+    # IP 기준 rate limit 미들웨어로 감싸기
+    app = RateLimitMiddleware(fastmcp_app)
 
     port = int(os.environ.get("PORT", 8080))
     uvicorn.run(app, host="0.0.0.0", port=port)
