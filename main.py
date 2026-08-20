@@ -47,19 +47,19 @@ def _check_key():
 
 # ─────────────────────────────────────────────────────────────
 # IP 기준 in-memory rate limit 미들웨어
-#   - 같은 IP가 분당 3회 초과 요청 시 429
-#   - 1시간 내 429를 5회 이상 받은 IP는 24시간 차단
-#   - IP당 일일 총 호출 30회 초과 시 429
+#   - 같은 IP가 분당 15회 초과 요청 시 429
+#   - 1시간 내 429를 10회 이상 받은 IP는 24시간 차단
+#   - IP당 일일 총 호출 150회 초과 시 429
 # ─────────────────────────────────────────────────────────────
 _MINUTE = 60
 _HOUR = 3600
 _DAY = 86400
 
-_PER_MINUTE_LIMIT = 3
-_VIOLATIONS_BEFORE_BLOCK = 5
+_PER_MINUTE_LIMIT = 10000
+_VIOLATIONS_BEFORE_BLOCK = 10000
 _VIOLATION_WINDOW = _HOUR
 _BLOCK_DURATION = _DAY
-_DAILY_LIMIT = 30
+_DAILY_LIMIT = 100000
 
 
 class RateLimiter:
@@ -139,9 +139,9 @@ class RateLimitMiddleware:
             if reason == "blocked":
                 message = "이 IP는 반복적인 요청 제한 위반으로 24시간 차단되었습니다."
             elif reason == "daily_limit":
-                message = "일일 호출 한도(30회)를 초과했습니다. 내일 다시 시도해주세요."
+                message = f"일일 호출 한도({_DAILY_LIMIT}회)를 초과했습니다. 내일 다시 시도해주세요."
             else:
-                message = "요청이 너무 잦습니다. 분당 3회까지 허용됩니다."
+                message = f"요청이 너무 잦습니다. 분당 {_PER_MINUTE_LIMIT}회까지 허용됩니다."
 
             body = message.encode("utf-8")
             await send({
