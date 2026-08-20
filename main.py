@@ -182,6 +182,20 @@ _DATASET_INFO = {
         "dataset_id": "OA-1200",
         "provider": "서울특별시 기후환경본부 대기정책과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-1200/S/1/datasetView.do",
+        "service_name": "ListAirQualityByDistrictService",
+    },
+    "OA-1200-ZONAL": {
+        "dataset_name": "서울시 권역별 실시간 대기환경 현황",
+        "dataset_id": "RealtimeCityAir",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA-1200/S/1/datasetView.do",
+        "service_name": "RealtimeCityAir",
+        "static_reference_note": (
+            "2026-08-20: 기존에 이 서비스(RealtimeCityAir, 권역별)가 OA-1200(자치구별) "
+            "데이터셋 ID로 잘못 표기되어 있던 것을 바로잡음. RealtimeCityAir는 도심권/동북권/"
+            "동남권/서북권/서남권 5개 권역 단위 데이터이며, 진짜 자치구별 데이터는 "
+            "ListAirQualityByDistrictService(get_realtime_air_quality)를 사용해야 한다."
+        ),
     },
     "OA-2275": {
         "dataset_name": "서울시 시간 평균 대기오염도 정보",
@@ -311,9 +325,79 @@ _DATASET_INFO = {
         "provider": "서울특별시 기후환경본부 자원회수시설추진단 자원회수시설과",
         "source_url": "https://data.seoul.go.kr/dataList/OA-1256/S/1/datasetView.do",
     },
+    "YearlyOzoneIssue": {
+        "dataset_name": "서울시 연도별 오존 경보발령 현황",
+        "dataset_id": "YearlyOzoneIssue",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA/S/1/datasetView.do",
+        "static_reference_note": (
+            "확인 필요(DEVLOG.md 참고): 이 데이터셋의 정확한 OA 데이터셋 번호를 "
+            "DEVPLAN.md에서 확인하지 못해 서비스명을 임시 dataset_id로 사용 중이다. "
+            "원문 링크는 data.seoul.go.kr 데이터셋 검색에서 서비스명(YearlyOzoneIssue)으로 "
+            "직접 확인해야 한다."
+        ),
+    },
+    "SearchMeasuringSTNOfAirQualityService": {
+        "dataset_name": "서울시 지역 구별 측정소 행정코드 정보",
+        "dataset_id": "SearchMeasuringSTNOfAirQualityService",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA/S/1/datasetView.do",
+        "static_reference_note": (
+            "확인 필요(DEVLOG.md 참고): 정확한 OA 데이터셋 번호 미확인으로 서비스명을 "
+            "임시 dataset_id로 사용 중이다. 이 데이터셋은 정적 참고정보(측정소 행정코드 "
+            "매핑표)이며 API 응답에 갱신일자 필드가 없다."
+        ),
+    },
+    "YearlyAverageAirQuality": {
+        "dataset_name": "서울시 년도별 평균 대기오염도 정보",
+        "dataset_id": "YearlyAverageAirQuality",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA/S/1/datasetView.do",
+        "static_reference_note": (
+            "확인 필요(DEVLOG.md 참고): 정확한 OA 데이터셋 번호를 DEVPLAN.md에서 "
+            "확인하지 못해 서비스명을 임시 dataset_id로 사용 중이다."
+        ),
+    },
+    "yearMicroDustInfo": {
+        "dataset_name": "서울시 초미세먼지 연도별 발령정보",
+        "dataset_id": "yearMicroDustInfo",
+        "provider": "서울특별시 기후환경본부 대기정책과",
+        "source_url": "https://data.seoul.go.kr/dataList/OA/S/1/datasetView.do",
+        "static_reference_note": (
+            "확인 필요(DEVLOG.md 참고): 정확한 OA 데이터셋 번호를 DEVPLAN.md에서 "
+            "확인하지 못해 서비스명을 임시 dataset_id로 사용 중이다."
+        ),
+    },
 }
 
 _DATETIME_FIELD_CANDIDATES = ["MSRDT", "MSRMT_DT", "MSRDATE", "MSRMT_YMD", "MSRMT_MM"]
+
+_NON_NUMERIC_MEASUREMENT_STATES = ("운휴중", "점검중")
+
+
+def _parse_measurement_value(v) -> dict:
+    """굴뚝 측정값(MSRMT_VL) 등, 숫자 대신 상태 문자열이 올 수 있는 필드를 안전 파싱한다.
+
+    실측 확인된 상태 문자열은 "운휴중" 뿐이며, "점검중"은 DEVPLAN 3-3절 지침에 따라
+    추정으로 미리 등록해 둔 것이다 — 실측으로 다른 상태 문자열이 확인되면
+    DEVLOG.md에 "확인 필요"로 기록하고 이 목록에 추가할 것.
+    """
+    if v in _NON_NUMERIC_MEASUREMENT_STATES:
+        return {"msrmt_status": v, "msrmt_value": None}
+    try:
+        return {"msrmt_status": "정상", "msrmt_value": float(v)}
+    except (ValueError, TypeError):
+        return {"msrmt_status": "알수없음", "msrmt_value": v}
+
+
+def _safe_float(v):
+    """빈 문자열/None을 0.0이 아닌 None으로 구분한다 (실측 미발생과 0을 혼동 방지)."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
 
 
 def _format_msrdt(raw: str) -> str:
@@ -510,17 +594,23 @@ def _add_air_quality_grade(row: dict) -> dict:
 
 
 @mcp.tool()
-async def get_realtime_air_quality(district: str = "", start: int = 1, end: int = 25) -> dict:
+async def get_zonal_realtime_air_quality(area: str = "", start: int = 1, end: int = 25) -> dict:
     """
-    서울시 25개 자치구의 실시간 대기환경 현황을 조회한다. (OA-1200 기반)
+    서울시 5개 권역(도심권/동북권/동남권/서북권/서남권)의 실시간 대기환경 현황을
+    조회한다. (서비스명: RealtimeCityAir)
 
+    ⚠️ "실시간" 권역별 현재 스냅샷이다. 기존 특정 시각/기간의 시간평균 데이터가
+    필요하면 get_zonal_hourly_air_quality(서비스명 TimeAverageCityAir 계열)를 사용하라.
+    자치구(구) 단위 데이터가 필요하면 get_realtime_air_quality(서비스명
+    ListAirQualityByDistrictService)를 사용하라 — 이 도구는 자치구가 아닌 권역
+    단위이다.
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
     ⚠️ 필수(생략 불가): 각 행의 station_intake_height_m(채취구 높이, m)과
     station_location_address(측정소 위치 주소)를 답변에 반드시 함께 표시하라.
 
     Args:
-        district: 자치구 이름 (예: "강남구"). 비워두면 전체 자치구 반환.
+        area: 권역명 (예: "도심권", "동북권", "동남권", "서북권", "서남권"). 비워두면 전체 권역 반환.
         start: 조회 시작 인덱스 (기본 1)
         end: 조회 종료 인덱스 (기본 25)
     """
@@ -533,14 +623,14 @@ async def get_realtime_air_quality(district: str = "", start: int = 1, end: int 
         data = resp.json()
 
     rows = data.get("RealtimeCityAir", {}).get("row", [])
-    if district:
-        rows = [r for r in rows if district in r.get("MSRSTN_NM", "")]
+    if area:
+        rows = [r for r in rows if area in r.get("MSRSTN_NM", "")]
 
     rows = [_add_air_quality_grade(r) for r in rows]
     heights = await _get_station_heights()
     rows = _attach_station_info(rows, heights)
 
-    citation = _citation("OA-1200", rows=rows)
+    citation = _citation("OA-1200-ZONAL", rows=rows)
     return _with_height_caveat({
         "count": len(rows),
         "data": rows,
@@ -594,7 +684,7 @@ async def get_hourly_air_quality(
     date: str, hour: str = "", district: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    특정 날짜(또는 특정 시)의 자치구별 시간평균 대기오염도를 조회한다. (OA-2275 기반)
+    특정 날짜(또는 특정 시)의 자치구별 시간 평균 대기오염도를 조회한다. (OA-2275 기반)
 
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
     ⚠️ 필수(생략 불가): 응답의 "_measurement_representativeness" 문구도 답변에 함께 안내하라.
@@ -1189,9 +1279,14 @@ async def get_chimney_emission_measurement(
     facility_name: str = "", pollutant: str = "", start: int = 1, end: int = 100
 ) -> dict:
     """
-    서울시 4개 자원회수시설(소각장) 굴뚝의 대기오염물질 자동측정값을 조회한다. (OA-1256 기반)
+    서울시 4개 자원회수시설(강남/노원/마포/양천, 소각장) 굴뚝의 대기오염물질
+    자동측정값을 조회한다. (OA-1256 기반, 서비스명: CleanSYSService)
 
     ⚠️ 배출허용기준(법적 한도) 없음 — 초과 여부는 이 실측값만으로 단정하지 말 것.
+    ⚠️ MSRMT_VL(측정값)은 시설 운휴 시간대에 숫자가 아닌 "운휴중" 등 상태 문자열로
+    올 수 있다. 각 행에 msrmt_status/msrmt_value로 안전 파싱된 값이 추가되어
+    있으니, 숫자 계산 시 msrmt_value(None일 수 있음)를 사용하고 원본 MSRMT_VL을
+    그대로 숫자로 취급하지 말 것.
     ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
 
     Args:
@@ -1214,7 +1309,205 @@ async def get_chimney_emission_measurement(
         data = resp.json()
 
     rows = data.get("CleanSYSService", {}).get("row", [])
+    rows = [dict(r, **_parse_measurement_value(r.get("MSRMT_VL"))) for r in rows]
     citation = _citation("OA-1256", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_realtime_air_quality(district_code: str = "", start: int = 1, end: int = 25) -> dict:
+    """
+    서울시 25개 자치구의 실시간 대기환경 현황을 조회한다.
+    (서비스명: ListAirQualityByDistrictService)
+
+    ⚠️ 이 도구는 "자치구" 단위이다. "권역"(도심권/동북권 등) 단위 실시간 데이터가
+    필요하면 get_zonal_realtime_air_quality(서비스명 RealtimeCityAir)를 사용하라.
+    2026-08-20 이전에는 이 이름이 실수로 권역별 데이터(RealtimeCityAir)를 호출하는
+    도구에 붙어 있었으나, 지금은 진짜 자치구별 서비스로 정정되었다.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    Args:
+        district_code: 측정소 행정코드(MSRSTN_PBADMS_CD, 예: "111123"=종로구).
+            비워두면 전체 자치구 반환. get_station_admin_codes로 코드를 조회할 수 있다.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 25)
+    """
+    _check_key()
+    parts = [BASE_URL, _get_api_key(), "json", "ListAirQualityByDistrictService", str(start), str(end)]
+    if district_code:
+        parts.append(district_code)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("ListAirQualityByDistrictService", {}).get("row", [])
+    citation = _citation("OA-1200", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_yearly_ozone_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
+    """
+    서울시 연도별 오존 경보발령 현황(발령횟수·발령일수·최고농도)을 조회한다.
+    (서비스명: YearlyOzoneIssue)
+
+    ⚠️ MAX_DNST(최고농도, ppm)는 발령 횟수가 0인 연도에 빈 값으로 올 수 있다.
+    각 행에 안전 파싱된 max_dnst_ppm(None일 수 있음)이 추가되어 있으니, 0(정상
+    측정값)과 값 없음(발령 자체가 없어 측정 안 됨)을 혼동하지 말 것 — None은
+    "발령 없어 측정값 없음"을 의미한다.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    Args:
+        year: 조회할 연도 (예: "2024"). 비워두면 전체 연도.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 30)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{_get_api_key()}/json/YearlyOzoneIssue/{start}/{end}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("YearlyOzoneIssue", {}).get("row", [])
+    if year:
+        rows = [r for r in rows if r.get("YR", "") == year]
+    rows = [dict(r, max_dnst_ppm=_safe_float(r.get("MAX_DNST"))) for r in rows]
+
+    citation = _citation("YearlyOzoneIssue", rows=rows, year_field="YR")
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_station_admin_codes(station_code: str = "", station_name: str = "", start: int = 1, end: int = 30) -> dict:
+    """
+    서울시 자치구별 측정소 행정코드(MSRSTN_CD)와 측정소명 매핑 정보를 조회한다.
+    (서비스명: SearchMeasuringSTNOfAirQualityService)
+
+    다른 도구(예: get_realtime_air_quality의 district_code)에서 쓰이는 코드값을
+    역으로 찾을 때 사용하는 조회용 도구이다.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    Args:
+        station_code: 측정소 행정코드 (MSRSTN_CD). 비워두면 전체.
+        station_name: 측정소명 (MSRSTN_NM). 비워두면 전체.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 30)
+    """
+    _check_key()
+    parts = [BASE_URL, _get_api_key(), "json", "SearchMeasuringSTNOfAirQualityService", str(start), str(end)]
+    if station_code:
+        parts.append(station_code)
+    url = "/".join(parts) + "/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("SearchMeasuringSTNOfAirQualityService", {}).get("row", [])
+    if station_name:
+        rows = [r for r in rows if station_name in r.get("MSRSTN_NM", "")]
+
+    citation = _citation("SearchMeasuringSTNOfAirQualityService", rows=rows)
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_yearly_air_quality(measurement_year: str, station_name: str = "", start: int = 1, end: int = 100) -> dict:
+    """
+    서울시 년도별 평균 대기오염도 정보(이산화질소·오존·일산화탄소·아황산가스·
+    미세먼지·초미세먼지의 연 평균)를 조회한다. (서비스명: YearlyAverageAirQuality)
+
+    ⚠️ measurement_year(측정년도)는 필수 파라미터이다 — 생략하면 API가
+    ERROR-300(필수값 누락)을 반환한다. 다른 도구들의 선택 파라미터와 달리
+    이 도구는 연도를 반드시 지정해야 한다.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    Args:
+        measurement_year: 측정년도 (YYYY, 필수, 예: "2023").
+        station_name: 측정소명 (예: "강남구", 도로변 측정소명도 가능, 예: "강남대로"). 비워두면 전체.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 100)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{_get_api_key()}/json/YearlyAverageAirQuality/{start}/{end}/{measurement_year}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("YearlyAverageAirQuality", {}).get("row", [])
+    if station_name:
+        rows = [r for r in rows if station_name in r.get("MSRSTN_NM", "")]
+
+    citation = _citation("YearlyAverageAirQuality", rows=rows, year_field="MSRMT_YR")
+    return {
+        "count": len(rows),
+        "data": rows,
+        "_data_source": citation,
+        "_citation_required": citation["citation_text"],
+    }
+
+
+@mcp.tool()
+async def get_yearly_pm25_alerts(year: str = "", start: int = 1, end: int = 30) -> dict:
+    """
+    서울시 초미세먼지(PM2.5) 연도별 발령정보(주의보예비단계/주의보/경보 3단계
+    발령횟수·발령일수, 연도별 최대농도)를 조회한다. (서비스명: yearMicroDustInfo)
+
+    ⚠️ 오존 경보(get_yearly_ozone_alerts)와 다른 데이터셋이다 — 이 도구는
+    초미세먼지 전용이며 주의보예비단계까지 3단계로 세분화되어 있다(오존 경보는
+    발령횟수/일수 2단계뿐).
+    ⚠️ MAX_DNST(최대농도)는 발령 횟수가 0인 연도에 빈 값으로 올 수 있다. 각 행에
+    안전 파싱된 max_dnst(None일 수 있음)가 추가되어 있으니, 0과 값 없음을
+    혼동하지 말 것.
+    ⚠️ 필수(생략 불가): 답변 맨 끝 줄에 응답의 "_citation_required" 값을 그대로 출력하라.
+
+    Args:
+        year: 조회할 연도 (예: "2024"). 비워두면 전체 연도.
+        start: 조회 시작 인덱스 (기본 1)
+        end: 조회 종료 인덱스 (기본 30)
+    """
+    _check_key()
+    url = f"{BASE_URL}/{_get_api_key()}/json/yearMicroDustInfo/{start}/{end}/"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        data = resp.json()
+
+    rows = data.get("yearMicroDustInfo", {}).get("row", [])
+    if year:
+        rows = [r for r in rows if r.get("YR", "") == year]
+    rows = [dict(r, max_dnst=_safe_float(r.get("MAX_DNST"))) for r in rows]
+
+    citation = _citation("yearMicroDustInfo", rows=rows, year_field="YR")
     return {
         "count": len(rows),
         "data": rows,
